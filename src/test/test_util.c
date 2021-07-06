@@ -1,22 +1,45 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2017, The Tor Project, Inc. */
+ * Copyright (c) 2007-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #include "orconfig.h"
-#define COMPAT_PRIVATE
 #define COMPAT_TIME_PRIVATE
-#define CONTROL_PRIVATE
-#define UTIL_PRIVATE
-#include "or.h"
-#include "buffers.h"
-#include "config.h"
-#include "control.h"
-#include "test.h"
-#include "memarea.h"
-#include "util_process.h"
-#include "log_test_helpers.h"
-#include "compress_zstd.h"
+#define UTIL_MALLOC_PRIVATE
+#define PROCESS_WIN32_PRIVATE
+#include "lib/testsupport/testsupport.h"
+#include "core/or/or.h"
+#include "lib/buf/buffers.h"
+#include "app/config/config.h"
+#include "feature/control/control.h"
+#include "feature/control/control_proto.h"
+#include "feature/client/transports.h"
+#include "lib/crypt_ops/crypto_format.h"
+#include "lib/crypt_ops/crypto_rand.h"
+#include "lib/defs/time.h"
+#include "test/test.h"
+#include "test/test_helpers.h"
+#include "lib/memarea/memarea.h"
+#include "lib/process/waitpid.h"
+#include "lib/process/process_win32.h"
+#include "test/log_test_helpers.h"
+#include "lib/compress/compress.h"
+#include "lib/compress/compress_zstd.h"
+#include "lib/encoding/keyval.h"
+#include "lib/fdio/fdio.h"
+#include "lib/fs/winlib.h"
+#include "lib/process/env.h"
+#include "lib/process/pidfile.h"
+#include "lib/intmath/weakrng.h"
+#include "lib/intmath/muldiv.h"
+#include "lib/thread/numcpus.h"
+#include "lib/math/fp.h"
+#include "lib/math/laplace.h"
+#include "lib/meminfo/meminfo.h"
+#include "lib/time/tvdiff.h"
+#include "lib/encoding/confline.h"
+#include "lib/net/socketpair.h"
+#include "lib/malloc/map_anon.h"
 
 #ifdef HAVE_PWD_H
 #include <pwd.h>
@@ -27,6 +50,22 @@
 #ifdef HAVE_UTIME_H
 #include <utime.h>
 #endif
+#ifdef HAVE_SYS_STAT_H
+#include <sys/stat.h>
+#endif
+#ifdef HAVE_FCNTL_H
+#include <fcntl.h>
+#endif
+#ifdef HAVE_UNISTD_H
+#include <unistd.h>
+#endif
+#ifdef HAVE_SYS_MMAN_H
+#include <sys/mman.h>
+#endif
+#ifdef HAVE_SYS_WAIT_H
+#include <sys/wait.h>
+#endif
+
 #ifdef _WIN32
 #include <tchar.h>
 #endif
@@ -34,8 +73,37 @@
 #include <ctype.h>
 #include <float.h>
 
+/* These platforms don't have meaningful pwdb or homedirs. */
+#if defined(_WIN32) || defined(__ANDROID__)
+#define DISABLE_PWDB_TESTS
+#endif
+
+static void set_file_mtime(const char *fname, time_t when);
+
 #define INFINITY_DBL ((double)INFINITY)
 #define NAN_DBL ((double)NAN)
+
+/** Test the tor_isinf() wrapper */
+static void
+test_tor_isinf(void *arg)
+{
+  (void) arg;
+
+  tt_assert(tor_isinf(INFINITY_DBL));
+
+  tt_assert(!tor_isinf(NAN_DBL));
+  tt_assert(!tor_isinf(DBL_EPSILON));
+  tt_assert(!tor_isinf(DBL_MAX));
+  tt_assert(!tor_isinf(DBL_MIN));
+
+  tt_assert(!tor_isinf(0.0));
+  tt_assert(!tor_isinf(0.1));
+  tt_assert(!tor_isinf(3));
+  tt_assert(!tor_isinf(3.14));
+
+ done:
+  ;
+}
 
 /* XXXX this is a minimal wrapper to make the unit tests compile with the
  * changed tor_timegm interface. */
@@ -141,6 +209,54 @@ test_util_read_file_eof_zero_bytes(void *arg)
   test_util_read_until_eof_impl("tor_test_fifo_empty", 0, 10000);
 }
 
+static void
+test_util_read_file_endlines(void *arg)
+{
+  (void)arg;
+
+  char *fname = NULL;
+  char *read_content = NULL;
+  int r = -1;
+
+  /* Write a file that contains both \n and \r\n as line ending. */
+  const char *file_content = "foo bar\n"
+                             "foo bar baz\r\n"
+                             "foo bar\r\n";
+
+  const char *expected_file_content = "foo bar\n"
+                                      "foo bar baz\n"
+                                      "foo bar\n";
+
+  fname = tor_strdup(get_fname("file_with_crlf_ending"));
+
+  r = write_bytes_to_file(fname, file_content, strlen(file_content), 1);
+  tt_int_op(r, OP_EQ, 0);
+
+  /* Read the file in text mode: we strip \r's from the files on both Windows
+   * and UNIX. */
+  read_content = read_file_to_str(fname, 0, NULL);
+
+  tt_ptr_op(read_content, OP_NE, NULL);
+  tt_int_op(strlen(read_content), OP_EQ, strlen(expected_file_content));
+  tt_str_op(read_content, OP_EQ, expected_file_content);
+
+  tor_free(read_content);
+
+  /* Read the file in binary mode: we should preserve the \r here. */
+  read_content = read_file_to_str(fname, RFTS_BIN, NULL);
+
+  tt_ptr_op(read_content, OP_NE, NULL);
+  tt_int_op(strlen(read_content), OP_EQ, strlen(file_content));
+  tt_str_op(read_content, OP_EQ, file_content);
+
+  tor_free(read_content);
+
+ done:
+  unlink(fname);
+  tor_free(fname);
+  tor_free(read_content);
+}
+
 /* Test the basic expected behaviour for write_chunks_to_file.
  * NOTE: This will need to be updated if we ever change the tempfile location
  * or extension */
@@ -242,6 +358,56 @@ test_util_write_chunks_to_file(void *arg)
   tor_free(temp_str);
 }
 
+/* Test write_str_to_file_if_not_equal(). */
+static void
+test_util_write_str_if_changed(void *arg)
+{
+  (void)arg;
+  char *fname = tor_strdup(get_fname("write_if_changed"));
+  char *s = NULL;
+  int rv;
+  const char str1[] = "The wombat lives across the seas";
+  const char str2[] = "Among the far Antipodes"; /* -- Ogden Nash */
+
+  /* We can create files. */
+  rv = write_str_to_file_if_not_equal(fname, str1);
+  tt_int_op(rv, OP_EQ, 0);
+  s = read_file_to_str(fname, 0, NULL);
+  tt_str_op(s, OP_EQ, str1);
+  tor_free(s);
+
+  /* We can replace files. */
+  rv = write_str_to_file_if_not_equal(fname, str2);
+  tt_int_op(rv, OP_EQ, 0);
+  s = read_file_to_str(fname, 0, NULL);
+  tt_str_op(s, OP_EQ, str2);
+  tor_free(s);
+
+  /* Make sure we don't replace files when they're equal. (That's the whole
+   * point of the function we're testing. */
+  /* First, change the mtime of the file so that we can tell whether we
+   * replaced it. */
+  const time_t now = time(NULL);
+  const time_t five_sec_ago = now - 5;
+  set_file_mtime(fname, five_sec_ago);
+  rv = write_str_to_file_if_not_equal(fname, str2);
+  tt_int_op(rv, OP_EQ, 0);
+  /* Make sure that the file's mtime is unchanged... */
+  struct stat st;
+  rv = stat(fname, &st);
+  tt_int_op(rv, OP_EQ, 0);
+  tt_i64_op(st.st_mtime, OP_EQ, five_sec_ago);
+  /* And make sure its contents are unchanged. */
+  s = read_file_to_str(fname, 0, NULL);
+  tt_str_op(s, OP_EQ, str2);
+  tor_free(s);
+
+ done:
+  tor_free(fname);
+  tor_free(s);
+}
+
+#ifndef COCCI
 #define _TFE(a, b, f)  tt_int_op((a).f, OP_EQ, (b).f)
 /** test the minimum set of struct tm fields needed for a unique epoch value
  * this is also the set we use to test tor_timegm */
@@ -254,6 +420,7 @@ test_util_write_chunks_to_file(void *arg)
             _TFE(a, b, tm_min ); \
             _TFE(a, b, tm_sec ); \
           TT_STMT_END
+#endif /* !defined(COCCI) */
 
 static void
 test_util_time(void *arg)
@@ -372,7 +539,6 @@ test_util_time(void *arg)
 
 /* Assume tv_usec is an unsigned integer until proven otherwise */
 #define TV_USEC_MAX UINT_MAX
-#define TOR_USEC_PER_SEC 1000000
 
   /* Overflows in the result type */
 
@@ -658,6 +824,12 @@ test_util_time(void *arg)
     expect_single_log_msg_containing(msg);                              \
     teardown_capture_of_logs();                                         \
   } while (0)
+#define CHECK_POSSIBLE_EINVAL() do {                            \
+    if (mock_saved_log_n_entries()) {                           \
+      expect_single_log_msg_containing("Invalid argument");     \
+    }                                                           \
+    teardown_capture_of_logs();                                 \
+  } while (0)
 
 #define CHECK_TIMEGM_ARG_OUT_OF_RANGE(msg) \
     CHECK_TIMEGM_WARNING("Out-of-range argument to tor_timegm")
@@ -847,18 +1019,24 @@ test_util_time(void *arg)
    * depending on whether the implementation of the system gmtime(_r)
    * sets struct tm (1) or not (1970) */
   t_res = -1;
+  CAPTURE();
   tor_gmtime_r(&t_res, &b_time);
+  CHECK_POSSIBLE_EINVAL();
   tt_assert(b_time.tm_year == (1970-1900) ||
             b_time.tm_year == (1969-1900));
 
   if (sizeof(time_t) == 4 || sizeof(time_t) == 8) {
     t_res = -1*(1 << 30);
+    CAPTURE();
     tor_gmtime_r(&t_res, &b_time);
+    CHECK_POSSIBLE_EINVAL();
     tt_assert(b_time.tm_year == (1970-1900) ||
               b_time.tm_year == (1935-1900));
 
     t_res = INT32_MIN;
+    CAPTURE();
     tor_gmtime_r(&t_res, &b_time);
+    CHECK_POSSIBLE_EINVAL();
     tt_assert(b_time.tm_year == (1970-1900) ||
               b_time.tm_year == (1901-1900));
   }
@@ -868,7 +1046,9 @@ test_util_time(void *arg)
     /* one of the smallest tm_year values my 64 bit system supports:
      * b_time.tm_year == (-292275055LL-1900LL) without clamping */
     t_res = -9223372036854775LL;
+    CAPTURE();
     tor_gmtime_r(&t_res, &b_time);
+    CHECK_POSSIBLE_EINVAL();
     tt_assert(b_time.tm_year == (1970-1900) ||
               b_time.tm_year == (1-1900));
 
@@ -881,6 +1061,34 @@ test_util_time(void *arg)
     t_res = INT64_MIN;
     CAPTURE();
     tor_gmtime_r(&t_res, &b_time);
+    if (! (b_time.tm_year == (1970-1900) ||
+           b_time.tm_year == (1-1900))) {
+      tt_int_op(b_time.tm_year, OP_EQ, 1970-1900);
+    }
+    if (b_time.tm_year != 1970-1900) {
+      CHECK_TIMEGM_WARNING("Rounding up to ");
+    } else {
+      teardown_capture_of_logs();
+    }
+  }
+  {
+    /* As above, but with localtime. */
+    t_res = -9223372036854775LL;
+    CAPTURE();
+    tor_localtime_r(&t_res, &b_time);
+    CHECK_POSSIBLE_EINVAL();
+    tt_assert(b_time.tm_year == (1970-1900) ||
+              b_time.tm_year == (1-1900));
+
+    /* while unlikely, the system's gmtime(_r) could return
+     * a "correct" retrospective gregorian negative year value,
+     * which I'm pretty sure is:
+     * -1*(2^63)/60/60/24*2000/730485 + 1970 = -292277022657
+     * 730485 is the number of days in two millennia, including leap days
+     * (int64_t)b_time.tm_year == (-292277022657LL-1900LL) without clamping */
+    t_res = INT64_MIN;
+    CAPTURE();
+    tor_localtime_r(&t_res, &b_time);
     if (! (b_time.tm_year == (1970-1900) ||
            b_time.tm_year == (1-1900))) {
       tt_int_op(b_time.tm_year, OP_EQ, 1970-1900);
@@ -907,6 +1115,17 @@ test_util_time(void *arg)
     tt_assert(b_time.tm_year == (2037-1900) ||
               b_time.tm_year == (2038-1900));
   }
+  {
+    /* as above but with localtime. */
+    t_res = 3*(1 << 29);
+    tor_localtime_r(&t_res, &b_time);
+    tt_assert(b_time.tm_year == (2021-1900));
+
+    t_res = INT32_MAX;
+    tor_localtime_r(&t_res, &b_time);
+    tt_assert(b_time.tm_year == (2037-1900) ||
+              b_time.tm_year == (2038-1900));
+  }
 #endif /* SIZEOF_TIME_T == 4 || SIZEOF_TIME_T == 8 */
 
 #if SIZEOF_TIME_T == 8
@@ -914,7 +1133,9 @@ test_util_time(void *arg)
     /* one of the largest tm_year values my 64 bit system supports:
      * b_time.tm_year == (292278994L-1900L) without clamping */
     t_res = 9223372036854775LL;
+    CAPTURE();
     tor_gmtime_r(&t_res, &b_time);
+    CHECK_POSSIBLE_EINVAL();
     tt_assert(b_time.tm_year == (2037-1900) ||
               b_time.tm_year == (9999-1900));
 
@@ -927,6 +1148,29 @@ test_util_time(void *arg)
     t_res = INT64_MAX;
     CAPTURE();
     tor_gmtime_r(&t_res, &b_time);
+    CHECK_TIMEGM_WARNING("Rounding down to ");
+
+    tt_assert(b_time.tm_year == (2037-1900) ||
+              b_time.tm_year == (9999-1900));
+  }
+  {
+    /* As above but with localtime. */
+    t_res = 9223372036854775LL;
+    CAPTURE();
+    tor_localtime_r(&t_res, &b_time);
+    CHECK_POSSIBLE_EINVAL();
+    tt_assert(b_time.tm_year == (2037-1900) ||
+              b_time.tm_year == (9999-1900));
+
+    /* while unlikely, the system's gmtime(_r) could return
+     * a "correct" proleptic gregorian year value,
+     * which I'm pretty sure is:
+     * (2^63-1)/60/60/24*2000/730485 + 1970 = 292277026596
+     * 730485 is the number of days in two millennia, including leap days
+     * (int64_t)b_time.tm_year == (292277026596L-1900L) without clamping */
+    t_res = INT64_MAX;
+    CAPTURE();
+    tor_localtime_r(&t_res, &b_time);
     CHECK_TIMEGM_WARNING("Rounding down to ");
 
     tt_assert(b_time.tm_year == (2037-1900) ||
@@ -957,7 +1201,10 @@ test_util_time(void *arg)
 
   /* This value is out of range with 32 bit time_t, but in range for 64 bit
    * time_t */
+  CAPTURE();
   format_rfc1123_time(timestr, (time_t)2150000000UL);
+  CHECK_POSSIBLE_EINVAL();
+
 #if SIZEOF_TIME_T == 4
 #if 0
   /* Wrapping around will have made it this. */
@@ -1126,7 +1373,9 @@ test_util_time(void *arg)
   /* This value is out of range with 32 bit time_t, but in range for 64 bit
    * time_t */
   tv.tv_sec = (time_t)2150000000UL;
+  CAPTURE();
   format_iso_time(timestr, (time_t)tv.tv_sec);
+  CHECK_POSSIBLE_EINVAL();
 #if SIZEOF_TIME_T == 4
   /* format_iso_time should indicate failure on overflow, but it doesn't yet.
    * Hopefully #18480 will improve the failure semantics in this case.
@@ -1141,6 +1390,7 @@ test_util_time(void *arg)
 
 #undef CAPTURE
 #undef CHECK_TIMEGM_ARG_OUT_OF_RANGE
+#undef CHECK_POSSIBLE_EINVAL
 
  done:
   teardown_capture_of_logs();
@@ -1700,7 +1950,57 @@ test_util_config_line_crlf(void *arg)
   tor_free(k); tor_free(v);
 }
 
-#ifndef _WIN32
+static void
+test_util_config_line_partition(void *arg)
+{
+  (void)arg;
+  config_line_t *lines = NULL, *orig, *rest = NULL;
+
+  config_line_append(&lines, "Header", "X");
+  config_line_append(&lines, "Item", "Y");
+  config_line_append(&lines, "Thing", "Z");
+
+  config_line_append(&lines, "HEADER", "X2");
+
+  config_line_append(&lines, "header", "X3");
+  config_line_append(&lines, "Item3", "Foob");
+
+  /* set up h2 and h3 to point to the places where we hope the headers will
+     be. */
+  config_line_t *h2 = lines->next->next->next;
+  config_line_t *h3 = h2->next;
+  tt_str_op(h2->key, OP_EQ, "HEADER");
+  tt_str_op(h3->key, OP_EQ, "header");
+
+  orig = lines;
+  rest = config_lines_partition(lines, "Header");
+  tt_ptr_op(lines, OP_EQ, orig);
+  tt_ptr_op(rest, OP_EQ, h2);
+  tt_str_op(lines->next->key, OP_EQ, "Item");
+  tt_str_op(lines->next->next->key, OP_EQ, "Thing");
+  tt_ptr_op(lines->next->next->next, OP_EQ, NULL);
+  config_free_lines(lines);
+
+  orig = lines = rest;
+  rest = config_lines_partition(lines, "Header");
+  tt_ptr_op(lines, OP_EQ, orig);
+  tt_ptr_op(rest, OP_EQ, h3);
+  tt_ptr_op(lines->next, OP_EQ, NULL);
+  config_free_lines(lines);
+
+  orig = lines = rest;
+  rest = config_lines_partition(lines, "Header");
+  tt_ptr_op(lines, OP_EQ, orig);
+  tt_ptr_op(rest, OP_EQ, NULL);
+  tt_str_op(lines->next->key, OP_EQ, "Item3");
+  tt_ptr_op(lines->next->next, OP_EQ, NULL);
+
+ done:
+  config_free_lines(lines);
+  config_free_lines(rest);
+}
+
+#ifndef DISABLE_PWDB_TESTS
 static void
 test_util_expand_filename(void *arg)
 {
@@ -1797,7 +2097,7 @@ test_util_expand_filename(void *arg)
  done:
   tor_free(str);
 }
-#endif /* !defined(_WIN32) */
+#endif /* !defined(DISABLE_PWDB_TESTS) */
 
 /** Test tor_escape_str_for_pt_args(). */
 static void
@@ -1900,8 +2200,8 @@ test_util_strmisc(void *arg)
   tor_snprintf(buf, 10, "abcdef");
   tt_int_op(0,OP_EQ, buf[6]);
   /* uint64 */
-  tor_snprintf(buf, sizeof(buf), "x!"U64_FORMAT"!x",
-               U64_PRINTF_ARG(U64_LITERAL(12345678901)));
+  tor_snprintf(buf, sizeof(buf), "x!%"PRIu64"!x",
+               (UINT64_C(12345678901)));
   tt_str_op("x!12345678901!x",OP_EQ, buf);
 
   /* Test str{,case}cmpstart */
@@ -1942,14 +2242,14 @@ test_util_strmisc(void *arg)
   /* Test mem_is_zero */
   memset(buf,0,128);
   buf[128] = 'x';
-  tt_assert(tor_mem_is_zero(buf, 10));
-  tt_assert(tor_mem_is_zero(buf, 20));
-  tt_assert(tor_mem_is_zero(buf, 128));
-  tt_assert(!tor_mem_is_zero(buf, 129));
+  tt_assert(fast_mem_is_zero(buf, 10));
+  tt_assert(fast_mem_is_zero(buf, 20));
+  tt_assert(fast_mem_is_zero(buf, 128));
+  tt_assert(!fast_mem_is_zero(buf, 129));
   buf[60] = (char)255;
-  tt_assert(!tor_mem_is_zero(buf, 128));
+  tt_assert(!fast_mem_is_zero(buf, 128));
   buf[0] = (char)1;
-  tt_assert(!tor_mem_is_zero(buf, 10));
+  tt_assert(!fast_mem_is_zero(buf, 10));
 
   /* Test 'escaped' */
   tt_ptr_op(escaped(NULL), OP_EQ, NULL);
@@ -2063,15 +2363,6 @@ test_util_strmisc(void *arg)
   tt_int_op(strcmp_opt(NULL,  "foo"), OP_LT, 0);
   tt_int_op(strcmp_opt("foo", NULL),  OP_GT, 0);
 
-  /* Test strcmp_len */
-  tt_int_op(strcmp_len("foo", "bar", 3),   OP_GT, 0);
-  tt_int_op(strcmp_len("foo", "bar", 2),   OP_LT, 0);
-  tt_int_op(strcmp_len("foo2", "foo1", 4), OP_GT, 0);
-  tt_int_op(strcmp_len("foo2", "foo1", 3), OP_LT, 0); /* Really stop at len */
-  tt_int_op(strcmp_len("foo2", "foo", 3), OP_EQ, 0);  /* Really stop at len */
-  tt_int_op(strcmp_len("blah", "", 4),     OP_GT, 0);
-  tt_int_op(strcmp_len("blah", "", 0),    OP_EQ, 0);
-
  done:
   tor_free(cp_tmp);
 }
@@ -2114,20 +2405,10 @@ test_util_parse_integer(void *arg)
   tt_int_op(1,OP_EQ, i);
   tt_str_op(cp,OP_EQ, " plus garbage");
   /* Illogical min max */
-  tor_capture_bugs_(1);
   tt_int_op(0L,OP_EQ,  tor_parse_long("10",10,50,4,&i,NULL));
   tt_int_op(0,OP_EQ, i);
-  tt_int_op(1, OP_EQ, smartlist_len(tor_get_captured_bug_log_()));
-  tt_str_op("!(max < min)", OP_EQ,
-            smartlist_get(tor_get_captured_bug_log_(), 0));
-  tor_end_capture_bugs_();
-  tor_capture_bugs_(1);
   tt_int_op(0L,OP_EQ,   tor_parse_long("-50",10,100,-100,&i,NULL));
   tt_int_op(0,OP_EQ, i);
-  tt_int_op(1, OP_EQ, smartlist_len(tor_get_captured_bug_log_()));
-  tt_str_op("!(max < min)", OP_EQ,
-            smartlist_get(tor_get_captured_bug_log_(), 0));
-  tor_end_capture_bugs_();
   /* Out of bounds */
   tt_int_op(0L,OP_EQ,  tor_parse_long("10",10,50,100,&i,NULL));
   tt_int_op(0,OP_EQ, i);
@@ -2138,11 +2419,8 @@ test_util_parse_integer(void *arg)
   tt_int_op(0L,OP_EQ,   tor_parse_long("2",2,0,100,NULL,NULL));
   tt_int_op(68284L,OP_EQ, tor_parse_long("10abc",16,0,70000,NULL,NULL));
   tt_int_op(68284L,OP_EQ, tor_parse_long("10ABC",16,0,70000,NULL,NULL));
-  tor_capture_bugs_(2);
   tt_int_op(0L,OP_EQ,   tor_parse_long("10",-2,0,100,NULL,NULL));
   tt_int_op(0,OP_EQ, tor_parse_long("10ABC",-1,0,70000,&i,NULL));
-  tt_int_op(2, OP_EQ, smartlist_len(tor_get_captured_bug_log_()));
-  tor_end_capture_bugs_();
   tt_int_op(i,OP_EQ, 0);
 
   /* Test parse_ulong */
@@ -2155,40 +2433,34 @@ test_util_parse_integer(void *arg)
   tt_int_op(0UL,OP_EQ, tor_parse_ulong("8",8,0,100,NULL,NULL));
   tt_int_op(50UL,OP_EQ, tor_parse_ulong("50",10,50,100,NULL,NULL));
   tt_int_op(0UL,OP_EQ, tor_parse_ulong("-50",10,0,100,NULL,NULL));
-  tor_capture_bugs_(1);
   tt_int_op(0UL,OP_EQ, tor_parse_ulong("50",-1,50,100,&i,NULL));
-  tt_int_op(1, OP_EQ, smartlist_len(tor_get_captured_bug_log_()));
-  tor_end_capture_bugs_();
   tt_int_op(0,OP_EQ, i);
   tt_int_op(0UL,OP_EQ, tor_parse_ulong("-50",10,0,100,&i,NULL));
   tt_int_op(0,OP_EQ, i);
 
   /* Test parse_uint64 */
-  tt_assert(U64_LITERAL(10) == tor_parse_uint64("10 x",10,0,100, &i, &cp));
+  tt_assert(UINT64_C(10) == tor_parse_uint64("10 x",10,0,100, &i, &cp));
   tt_int_op(1,OP_EQ, i);
   tt_str_op(cp,OP_EQ, " x");
-  tt_assert(U64_LITERAL(12345678901) ==
+  tt_assert(UINT64_C(12345678901) ==
               tor_parse_uint64("12345678901",10,0,UINT64_MAX, &i, &cp));
   tt_int_op(1,OP_EQ, i);
   tt_str_op(cp,OP_EQ, "");
-  tt_assert(U64_LITERAL(0) ==
+  tt_assert(UINT64_C(0) ==
               tor_parse_uint64("12345678901",10,500,INT32_MAX, &i, &cp));
   tt_int_op(0,OP_EQ, i);
-  tor_capture_bugs_(1);
-  tt_assert(U64_LITERAL(0) ==
+  tt_assert(UINT64_C(0) ==
               tor_parse_uint64("123",-1,0,INT32_MAX, &i, &cp));
-  tt_int_op(1, OP_EQ, smartlist_len(tor_get_captured_bug_log_()));
-  tor_end_capture_bugs_();
   tt_int_op(0,OP_EQ, i);
 
   {
   /* Test parse_double */
   double d = tor_parse_double("10", 0, (double)UINT64_MAX,&i,NULL);
   tt_int_op(1,OP_EQ, i);
-  tt_assert(DBL_TO_U64(d) == 10);
+  tt_assert(((uint64_t)d) == 10);
   d = tor_parse_double("0", 0, (double)UINT64_MAX,&i,NULL);
   tt_int_op(1,OP_EQ, i);
-  tt_assert(DBL_TO_U64(d) == 0);
+  tt_assert(((uint64_t)d) == 0);
   d = tor_parse_double(" ", 0, (double)UINT64_MAX,&i,NULL);
   tt_double_op(fabs(d), OP_LT, 1e-10);
   tt_int_op(0,OP_EQ, i);
@@ -2200,7 +2472,7 @@ test_util_parse_integer(void *arg)
   tt_int_op(1,OP_EQ, i);
   d = tor_parse_double("-.0", 0, (double)UINT64_MAX,&i,NULL);
   tt_int_op(1,OP_EQ, i);
-  tt_assert(DBL_TO_U64(d) == 0);
+  tt_assert(((uint64_t)d) == 0);
   d = tor_parse_double("-10", -100.0, 100.0,&i,NULL);
   tt_int_op(1,OP_EQ, i);
   tt_double_op(fabs(d - -10.0),OP_LT, 1E-12);
@@ -2218,12 +2490,12 @@ test_util_parse_integer(void *arg)
     tt_int_op(i,OP_EQ, 0);
     tt_int_op(0UL,OP_EQ, tor_parse_ulong(TOOBIG, 10, 0, ULONG_MAX, &i, NULL));
     tt_int_op(i,OP_EQ, 0);
-    tt_u64_op(U64_LITERAL(0), OP_EQ, tor_parse_uint64(TOOBIG, 10,
+    tt_u64_op(UINT64_C(0), OP_EQ, tor_parse_uint64(TOOBIG, 10,
                                              0, UINT64_MAX, &i, NULL));
     tt_int_op(i,OP_EQ, 0);
   }
  done:
-  tor_end_capture_bugs_();
+  ;
 }
 
 static void
@@ -2241,17 +2513,17 @@ test_util_pow2(void *arg)
   tt_int_op(tor_log2(3),OP_EQ, 1);
   tt_int_op(tor_log2(4),OP_EQ, 2);
   tt_int_op(tor_log2(5),OP_EQ, 2);
-  tt_int_op(tor_log2(U64_LITERAL(40000000000000000)),OP_EQ, 55);
+  tt_int_op(tor_log2(UINT64_C(40000000000000000)),OP_EQ, 55);
   tt_int_op(tor_log2(UINT64_MAX),OP_EQ, 63);
 
   /* Test round_to_power_of_2 */
   tt_u64_op(round_to_power_of_2(120), OP_EQ, 128);
   tt_u64_op(round_to_power_of_2(128), OP_EQ, 128);
   tt_u64_op(round_to_power_of_2(130), OP_EQ, 128);
-  tt_u64_op(round_to_power_of_2(U64_LITERAL(40000000000000000)), OP_EQ,
-            U64_LITERAL(1)<<55);
-  tt_u64_op(round_to_power_of_2(U64_LITERAL(0xffffffffffffffff)), OP_EQ,
-          U64_LITERAL(1)<<63);
+  tt_u64_op(round_to_power_of_2(UINT64_C(40000000000000000)), OP_EQ,
+            UINT64_C(1)<<55);
+  tt_u64_op(round_to_power_of_2(UINT64_C(0xffffffffffffffff)), OP_EQ,
+          UINT64_C(1)<<63);
   tt_u64_op(round_to_power_of_2(0), OP_EQ, 1);
   tt_u64_op(round_to_power_of_2(1), OP_EQ, 1);
   tt_u64_op(round_to_power_of_2(2), OP_EQ, 2);
@@ -3151,6 +3423,21 @@ test_util_sscanf(void *arg)
   test_feq(d3, -900123123.2000787);
   test_feq(d4, 3.2);
 
+  /* missing float */
+  r = tor_sscanf("3 ", "%d %lf", &int1, &d1);
+  tt_int_op(r, OP_EQ, 1);
+  tt_int_op(int1, OP_EQ, 3);
+
+  /* not a float */
+  r = tor_sscanf("999 notafloat", "%d %lf", &int1, &d1);
+  tt_int_op(r, OP_EQ, 1);
+  tt_int_op(int1, OP_EQ, 999);
+
+  /* %s but no buffer. */
+  char *nullbuf = NULL;
+  r = tor_sscanf("hello", "%3s", nullbuf);
+  tt_int_op(r, OP_EQ, 0);
+
  done:
   tor_free(huge);
 }
@@ -3657,7 +3944,7 @@ test_util_memarea(void *arg)
   tt_int_op(((uintptr_t)p3) % sizeof(void*),OP_EQ, 0);
   tt_assert(!memarea_owns_ptr(area, p3+8192));
   tt_assert(!memarea_owns_ptr(area, p3+30));
-  tt_assert(tor_mem_is_zero(p2, 52));
+  tt_assert(fast_mem_is_zero(p2, 52));
   /* Make sure we don't overalign. */
   p1 = memarea_alloc(area, 1);
   p2 = memarea_alloc(area, 1);
@@ -3898,6 +4185,31 @@ test_util_find_str_at_start_of_line(void *ptr)
 }
 
 static void
+test_util_tor_strreplacechar(void *ptr)
+{
+  (void)ptr;
+  char empty[] = "";
+  char not_contain[] = "bbb";
+  char contains[] = "bab";
+  char contains_all[] = "aaa";
+
+  tor_strreplacechar(empty, 'a', 'b');
+  tt_str_op(empty, OP_EQ, "");
+
+  tor_strreplacechar(not_contain, 'a', 'b');
+  tt_str_op(not_contain, OP_EQ, "bbb");
+
+  tor_strreplacechar(contains, 'a', 'b');
+  tt_str_op(contains, OP_EQ, "bbb");
+
+  tor_strreplacechar(contains_all, 'a', 'b');
+  tt_str_op(contains_all, OP_EQ, "bbb");
+
+ done:
+  ;
+}
+
+static void
 test_util_string_is_C_identifier(void *ptr)
 {
   (void)ptr;
@@ -3921,6 +4233,93 @@ test_util_string_is_C_identifier(void *ptr)
   tt_int_op(0,OP_EQ, string_is_C_identifier("_;"));
   tt_int_op(0,OP_EQ, string_is_C_identifier("í"));
   tt_int_op(0,OP_EQ, string_is_C_identifier("ñ"));
+
+ done:
+  ;
+}
+
+static void
+test_util_string_is_utf8(void *ptr)
+{
+  (void)ptr;
+
+  tt_int_op(1, OP_EQ, string_is_utf8(NULL, 0));
+  tt_int_op(1, OP_EQ, string_is_utf8("", 1));
+  tt_int_op(1, OP_EQ, string_is_utf8("\uFEFF", 3));
+  tt_int_op(1, OP_EQ, string_is_utf8("\uFFFE", 3));
+  tt_int_op(1, OP_EQ, string_is_utf8("ascii\x7f\n", 7));
+  tt_int_op(1, OP_EQ, string_is_utf8("Risqu\u00e9=1", 9));
+
+  /* Test the utf8_no_bom function */
+  tt_int_op(0, OP_EQ, string_is_utf8_no_bom("\uFEFF", 3));
+  tt_int_op(0, OP_EQ, string_is_utf8_no_bom("\uFFFE", 3));
+  tt_int_op(0, OP_EQ, string_is_utf8_no_bom("\uFEFFlove", 7));
+  tt_int_op(1, OP_EQ, string_is_utf8_no_bom("loveandrespect",
+                                            strlen("loveandrespect")));
+
+  // Validate exactly 'len' bytes.
+  tt_int_op(0, OP_EQ, string_is_utf8("\0\x80", 2));
+  tt_int_op(0, OP_EQ, string_is_utf8("Risqu\u00e9=1", 6));
+
+  // Reject sequences with missing bytes.
+  tt_int_op(0, OP_EQ, string_is_utf8("\x80", 1));
+  tt_int_op(0, OP_EQ, string_is_utf8("\xc2", 1));
+  tt_int_op(0, OP_EQ, string_is_utf8("\xc2 ", 2));
+  tt_int_op(0, OP_EQ, string_is_utf8("\xe1\x80", 2));
+  tt_int_op(0, OP_EQ, string_is_utf8("\xe1\x80 ", 3));
+  tt_int_op(0, OP_EQ, string_is_utf8("\xf1\x80\x80", 3));
+  tt_int_op(0, OP_EQ, string_is_utf8("\xf1\x80\x80 ", 4));
+
+  // Reject encodings that are overly long.
+  tt_int_op(0, OP_EQ, string_is_utf8("\xc1\xbf", 2));
+  tt_int_op(1, OP_EQ, string_is_utf8("\xc2\x80", 2));
+  tt_int_op(0, OP_EQ, string_is_utf8("\xe0\x9f\xbf", 3));
+  tt_int_op(1, OP_EQ, string_is_utf8("\xe0\xa0\x80", 3));
+  tt_int_op(0, OP_EQ, string_is_utf8("\xf0\x8f\xbf\xbf", 4));
+  tt_int_op(1, OP_EQ, string_is_utf8("\xf0\x90\x80\x80", 4));
+
+  // Reject UTF-16 surrogate halves.
+  tt_int_op(1, OP_EQ, string_is_utf8("\xed\x9f\xbf", 3));
+  tt_int_op(0, OP_EQ, string_is_utf8("\xed\xa0\x80", 3));
+  tt_int_op(0, OP_EQ, string_is_utf8("\xed\xbf\xbf", 3));
+  tt_int_op(1, OP_EQ, string_is_utf8("\xee\x80\x80", 3));
+
+  // The minimum legal codepoint, 0x00.
+  tt_int_op(1, OP_EQ, string_is_utf8("\0", 1));
+
+  // The maximum legal codepoint, 0x10FFFF.
+  tt_int_op(1, OP_EQ, string_is_utf8("\xf4\x8f\xbf\xbf", 4));
+  tt_int_op(0, OP_EQ, string_is_utf8("\xf4\x90\x80\x80", 4));
+
+  /* Test cases that vary between programming languages /
+   * UTF-8 implementations.
+   * Source: POC||GTFO 19, page 43
+   * https://www.alchemistowl.org/pocorgtfo/
+   */
+
+  // Invalid (in most implementations)
+  // surrogate
+  tt_int_op(0, OP_EQ, string_is_utf8("\xed\xa0\x81", 3));
+  // nullsurrog
+  tt_int_op(0, OP_EQ, string_is_utf8("\x30\x00\xed\xa0\x81", 5));
+  // threehigh
+  tt_int_op(0, OP_EQ, string_is_utf8("\xed\xbf\xbf", 3));
+  // fourhigh
+  tt_int_op(0, OP_EQ, string_is_utf8("\xf4\x90\xbf\xbf", 4));
+  // fivebyte
+  tt_int_op(0, OP_EQ, string_is_utf8("\xfb\x80\x80\x80\x80", 5));
+  // sixbyte
+  tt_int_op(0, OP_EQ, string_is_utf8("\xfd\x80\x80\x80\x80", 5));
+  // sixhigh
+  tt_int_op(0, OP_EQ, string_is_utf8("\xfd\xbf\xbf\xbf\xbf", 5));
+
+  // Valid (in most implementations)
+  // fourbyte
+  tt_int_op(1, OP_EQ, string_is_utf8("\xf0\x90\x8d\x88", 4));
+  // fourbyte2
+  tt_int_op(1, OP_EQ, string_is_utf8("\xf0\xbf\xbf\xbf", 4));
+  // nullbyte
+  tt_int_op(1, OP_EQ, string_is_utf8("\x30\x31\x32\x00\x33", 5));
 
  done:
   ;
@@ -4037,6 +4436,431 @@ test_util_listdir(void *ptr)
 }
 
 static void
+test_util_glob(void *ptr)
+{
+  (void)ptr;
+
+#ifdef HAVE_GLOB
+  smartlist_t *results = NULL;
+  int r, i;
+  char *dir1 = NULL, *dir2 = NULL, *forbidden = NULL, *dirname = NULL;
+  char *expected = NULL, *pattern = NULL;
+  // used for cleanup
+  char *dir1_forbidden = NULL, *dir2_forbidden = NULL;
+  char *forbidden_forbidden = NULL;
+
+  dirname = tor_strdup(get_fname("test_glob"));
+  tt_ptr_op(dirname, OP_NE, NULL);
+
+#ifdef _WIN32
+  r = mkdir(dirname);
+#else
+  r = mkdir(dirname, 0700);
+#endif
+  if (r) {
+    fprintf(stderr, "Can't create directory %s:", dirname);
+    perror("");
+    exit(1);
+  }
+
+  tt_int_op(0, OP_EQ, create_test_directory_structure(dirname));
+  tor_asprintf(&dir1, "%s"PATH_SEPARATOR"dir1", dirname);
+  tor_asprintf(&dir1_forbidden,
+               "%s"PATH_SEPARATOR"dir1"PATH_SEPARATOR"forbidden", dirname);
+  tt_int_op(0, OP_EQ, create_test_directory_structure(dir1));
+  tor_asprintf(&dir2, "%s"PATH_SEPARATOR"dir2", dirname);
+  tor_asprintf(&dir2_forbidden,
+               "%s"PATH_SEPARATOR"dir2"PATH_SEPARATOR"forbidden", dirname);
+  tt_int_op(0, OP_EQ, create_test_directory_structure(dir2));
+  tor_asprintf(&forbidden, "%s"PATH_SEPARATOR"forbidden", dirname);
+  tor_asprintf(&forbidden_forbidden,
+               "%s"PATH_SEPARATOR"forbidden"PATH_SEPARATOR"forbidden",dirname);
+#ifndef _WIN32
+  tt_int_op(0, OP_EQ, chmod(forbidden, 0700));
+#endif
+  tt_int_op(0, OP_EQ, create_test_directory_structure(forbidden));
+#ifndef _WIN32
+  tt_int_op(0, OP_EQ, chmod(forbidden, 0));
+#endif
+
+#define TEST(input) \
+  do { \
+    tor_asprintf(&pattern, "%s"PATH_SEPARATOR"%s", dirname, input); \
+    results = tor_glob(pattern); \
+    tor_free(pattern); \
+    tt_assert(results); \
+    smartlist_sort_strings(results); \
+  } while (0);
+
+#define EXPECT(result) \
+  do { \
+    tt_int_op(smartlist_len(results), OP_EQ, \
+                            sizeof(result)/sizeof(*result)); \
+    i = 0; \
+    SMARTLIST_FOREACH_BEGIN(results, const char *, f) { \
+      tor_asprintf(&expected, "%s"PATH_SEPARATOR"%s", dirname, result[i]); \
+      tt_str_op(f, OP_EQ, expected); \
+      i++; \
+      tor_free(expected); \
+    } SMARTLIST_FOREACH_END(f); \
+    SMARTLIST_FOREACH(results, char *, f, tor_free(f)); \
+    smartlist_free(results); \
+  } while (0);
+
+#define EXPECT_EMPTY() \
+  do { \
+    tt_int_op(smartlist_len(results), OP_EQ, 0); \
+    SMARTLIST_FOREACH(results, char *, f, tor_free(f)); \
+    smartlist_free(results); \
+  } while (0);
+
+  // wildcards at beginning
+  const char *results_test1[] = {"dir2", "file2"};
+  TEST("*2");
+  EXPECT(results_test1);
+
+  // wildcards at end
+  const char *results_test2[] = {"dir1", "dir2"};
+  TEST("d*");
+  EXPECT(results_test2);
+
+  // wildcards at beginning and end
+#ifdef _WIN32
+  // dot files are not ignored on Windows
+  const char *results_test3[] = {".test-hidden", "dir1", "dir2", "file1",
+                                 "file2", "forbidden"};
+#else
+  const char *results_test3[] = {"dir1", "dir2", "file1", "file2",
+                                 "forbidden"};
+#endif /* defined(_WIN32) */
+  TEST("*i*");
+  EXPECT(results_test3);
+
+  // wildcards in middle
+  const char *results_test4[] = {"dir1", "dir2"};
+  TEST("d?r*");
+  EXPECT(results_test4);
+
+  // test file that does not exist
+  TEST("not-exist");
+  EXPECT_EMPTY();
+
+  // test wildcard that matches nothing
+  TEST("*not-exist*");
+  EXPECT_EMPTY();
+
+  // test path separator at end - no wildcards
+  const char *results_test7[] = {"dir1"};
+  TEST("dir1");
+  EXPECT(results_test7);
+
+  const char *results_test8[] = {"dir1"};
+  TEST("dir1"PATH_SEPARATOR);
+  EXPECT(results_test8);
+
+  const char *results_test9[] = {"file1"};
+  TEST("file1");
+  EXPECT(results_test9);
+
+  TEST("file1"PATH_SEPARATOR);
+  EXPECT_EMPTY();
+
+  // test path separator at end - with wildcards and linux path separator
+  const char *results_test11[] = {"dir1", "dir2", "forbidden"};
+  TEST("*/");
+  EXPECT(results_test11);
+
+#ifdef _WIN32
+  // dot files are not ignored on Windows
+  const char *results_test12[] = {".test-hidden", "dir1", "dir2", "empty",
+                                  "file1", "file2", "forbidden"};
+#else
+  const char *results_test12[] = {"dir1", "dir2", "empty", "file1", "file2",
+                                  "forbidden"};
+#endif /* defined(_WIN32) */
+  TEST("*");
+  EXPECT(results_test12);
+
+  // wildcards on folder and file and linux path separator
+  const char *results_test13[] = {"dir1"PATH_SEPARATOR"dir1",
+                                  "dir1"PATH_SEPARATOR"dir2",
+                                  "dir1"PATH_SEPARATOR"file1",
+                                  "dir1"PATH_SEPARATOR"file2",
+                                  "dir2"PATH_SEPARATOR"dir1",
+                                  "dir2"PATH_SEPARATOR"dir2",
+                                  "dir2"PATH_SEPARATOR"file1",
+                                  "dir2"PATH_SEPARATOR"file2"};
+  TEST("?i*/?i*");
+  EXPECT(results_test13);
+
+  // wildcards on file only
+  const char *results_test14[] = {"dir1"PATH_SEPARATOR"dir1",
+                                  "dir1"PATH_SEPARATOR"dir2",
+                                  "dir1"PATH_SEPARATOR"file1",
+                                  "dir1"PATH_SEPARATOR"file2"};
+  TEST("dir1"PATH_SEPARATOR"?i*");
+  EXPECT(results_test14);
+
+  // wildcards on folder only
+  const char *results_test15[] = {"dir1"PATH_SEPARATOR"file1",
+                                  "dir2"PATH_SEPARATOR"file1"};
+  TEST("?i*"PATH_SEPARATOR"file1");
+  EXPECT(results_test15);
+
+  // wildcards after file name
+  TEST("file1"PATH_SEPARATOR"*");
+  EXPECT_EMPTY();
+
+#ifndef _WIN32
+  // test wildcard escaping
+  TEST("\\*");
+  EXPECT_EMPTY();
+
+  if (getuid() != 0) {
+    // test forbidden directory, if we're not root.
+    // (Root will be able to see this directory anyway.)
+    tor_asprintf(&pattern, "%s"PATH_SEPARATOR"*"PATH_SEPARATOR"*", dirname);
+    results = tor_glob(pattern);
+    tor_free(pattern);
+    tt_assert(!results);
+  }
+#endif /* !defined(_WIN32) */
+
+#undef TEST
+#undef EXPECT
+#undef EXPECT_EMPTY
+
+ done:
+#ifndef _WIN32
+  (void) chmod(forbidden, 0700);
+  (void) chmod(dir1_forbidden, 0700);
+  (void) chmod(dir2_forbidden, 0700);
+  (void) chmod(forbidden_forbidden, 0700);
+#endif /* !defined(_WIN32) */
+  tor_free(dir1);
+  tor_free(dir2);
+  tor_free(forbidden);
+  tor_free(dirname);
+  tor_free(dir1_forbidden);
+  tor_free(dir2_forbidden);
+  tor_free(forbidden_forbidden);
+  tor_free(expected);
+  tor_free(pattern);
+  if (results) {
+    SMARTLIST_FOREACH(results, char *, f, tor_free(f));
+    smartlist_free(results);
+  }
+#else /* !defined(HAVE_GLOB) */
+  tt_skip();
+ done:
+  return;
+#endif /* defined(HAVE_GLOB) */
+}
+
+static void
+test_util_get_glob_opened_files(void *ptr)
+{
+  (void)ptr;
+
+#ifdef HAVE_GLOB
+  smartlist_t *results = NULL;
+  int r, i;
+  char *dir1 = NULL, *dir2 = NULL, *forbidden = NULL, *dirname = NULL;
+  char *expected = NULL, *pattern = NULL;
+  // used for cleanup
+  char *dir1_forbidden = NULL, *dir2_forbidden = NULL;
+  char *forbidden_forbidden = NULL;
+
+  dirname = tor_strdup(get_fname("test_get_glob_opened_files"));
+  tt_ptr_op(dirname, OP_NE, NULL);
+
+#ifdef _WIN32
+  r = mkdir(dirname);
+#else
+  r = mkdir(dirname, 0700);
+#endif
+  if (r) {
+    fprintf(stderr, "Can't create directory %s:", dirname);
+    perror("");
+    exit(1);
+  }
+
+  tt_int_op(0, OP_EQ, create_test_directory_structure(dirname));
+  tor_asprintf(&dir1, "%s"PATH_SEPARATOR"dir1", dirname);
+  tor_asprintf(&dir1_forbidden,
+               "%s"PATH_SEPARATOR"dir1"PATH_SEPARATOR"forbidden", dirname);
+  tt_int_op(0, OP_EQ, create_test_directory_structure(dir1));
+  tor_asprintf(&dir2, "%s"PATH_SEPARATOR"dir2", dirname);
+  tor_asprintf(&dir2_forbidden,
+               "%s"PATH_SEPARATOR"dir2"PATH_SEPARATOR"forbidden", dirname);
+  tt_int_op(0, OP_EQ, create_test_directory_structure(dir2));
+  tor_asprintf(&forbidden, "%s"PATH_SEPARATOR"forbidden", dirname);
+  tor_asprintf(&forbidden_forbidden,
+               "%s"PATH_SEPARATOR"forbidden"PATH_SEPARATOR"forbidden",dirname);
+#ifndef _WIN32
+  chmod(forbidden, 0700);
+#endif
+  tt_int_op(0, OP_EQ, create_test_directory_structure(forbidden));
+#ifndef _WIN32
+  chmod(forbidden, 0);
+#endif
+
+#define TEST(input) \
+  do { \
+    if (*input) { \
+      tor_asprintf(&pattern, "%s"PATH_SEPARATOR"%s", dirname, input); \
+    } else { /* do not add path separator if empty string */ \
+      tor_asprintf(&pattern, "%s", dirname); \
+    } \
+    results = get_glob_opened_files(pattern); \
+    tor_free(pattern); \
+    tt_assert(results); \
+    smartlist_sort_strings(results); \
+  } while (0);
+
+#define EXPECT(result) \
+  do { \
+    tt_int_op(smartlist_len(results), OP_EQ, \
+                          sizeof(result)/sizeof(*result)); \
+    i = 0; \
+    SMARTLIST_FOREACH_BEGIN(results, const char *, f) { \
+      if (*result[i]) { \
+        tor_asprintf(&expected, "%s"PATH_SEPARATOR"%s", dirname, result[i]); \
+      } else { /* do not add path separator if empty string */ \
+        tor_asprintf(&expected, "%s", dirname); \
+      } \
+      tt_str_op(f, OP_EQ, expected); \
+      i++; \
+      tor_free(expected); \
+    } SMARTLIST_FOREACH_END(f); \
+    SMARTLIST_FOREACH(results, char *, f, tor_free(f)); \
+    smartlist_free(results); \
+  } while (0);
+
+#define EXPECT_EMPTY() \
+  do { \
+    tt_int_op(smartlist_len(results), OP_EQ, 0); \
+    SMARTLIST_FOREACH(results, char *, f, tor_free(f)); \
+    smartlist_free(results); \
+  } while (0);
+
+  // all files on folder
+  const char *results_test1[] = {""}; // only the folder is read
+  TEST("*");
+  EXPECT(results_test1);
+
+  // same as before but ending in path separator
+  const char *results_test2[] = {""}; // only the folder is read
+  TEST("*"PATH_SEPARATOR);
+  EXPECT(results_test2);
+
+  // wildcards in multiple path components
+#ifndef _WIN32
+  const char *results_test3[] = {"", "dir1", "dir2", "empty", "file1", "file2",
+                                 "forbidden"};
+#else
+  // dot files are not special on windows
+  const char *results_test3[] = {"", ".test-hidden", "dir1", "dir2", "empty",
+                                 "file1", "file2", "forbidden"};
+#endif /* !defined(_WIN32) */
+  TEST("*"PATH_SEPARATOR"*");
+  EXPECT(results_test3);
+
+  // same as before but ending in path separator
+#ifndef _WIN32
+  const char *results_test4[] = {"", "dir1", "dir2", "empty", "file1", "file2",
+                                 "forbidden"};
+#else
+  // dot files are not special on windows
+  const char *results_test4[] = {"", ".test-hidden", "dir1", "dir2", "empty",
+                                 "file1", "file2", "forbidden"};
+#endif /* !defined(_WIN32) */
+  TEST("*"PATH_SEPARATOR"*"PATH_SEPARATOR);
+  EXPECT(results_test4);
+
+  // no glob - folder
+  TEST("");
+  EXPECT_EMPTY();
+
+  // same as before but ending in path separator
+  TEST(PATH_SEPARATOR);
+  EXPECT_EMPTY();
+
+  // no glob - file
+  TEST("file1");
+  EXPECT_EMPTY();
+
+  // same as before but ending in path separator and linux path separator
+  TEST("file1/");
+  EXPECT_EMPTY();
+
+  // file but with wildcard after
+  const char *results_test9[] = {"file1"};
+  TEST("file1"PATH_SEPARATOR"*");
+  EXPECT(results_test9);
+
+  // dir inside dir and linux path separator
+  TEST("dir1/dir1");
+  EXPECT_EMPTY();
+
+  // same as before but ending in path separator
+  TEST("dir1"PATH_SEPARATOR"dir1"PATH_SEPARATOR);
+  EXPECT_EMPTY();
+
+  // no glob - empty
+  TEST("empty");
+  EXPECT_EMPTY();
+
+  // same as before but ending in path separator
+  TEST("empty"PATH_SEPARATOR);
+  EXPECT_EMPTY();
+
+  // no glob - does not exist
+  TEST("not_exist");
+  EXPECT_EMPTY();
+
+#undef TEST
+#undef EXPECT
+#undef EXPECT_EMPTY
+
+ done:
+#ifndef _WIN32
+  {
+    int chmod_failed = 0;
+    if (forbidden)
+    chmod_failed |= chmod(forbidden, 0700);
+    if (dir1_forbidden)
+      chmod_failed |= chmod(dir1_forbidden, 0700);
+    if (dir2_forbidden)
+      chmod_failed |= chmod(dir2_forbidden, 0700);
+    if (forbidden_forbidden)
+      chmod_failed |= chmod(forbidden_forbidden, 0700);
+    if (chmod_failed) {
+      TT_FAIL(("unable to chmod a file on cleanup: %s", strerror(errno)));
+    }
+  }
+#endif /* !defined(_WIN32) */
+  tor_free(dir1);
+  tor_free(dir2);
+  tor_free(forbidden);
+  tor_free(dirname);
+  tor_free(dir1_forbidden);
+  tor_free(dir2_forbidden);
+  tor_free(forbidden_forbidden);
+  tor_free(expected);
+  tor_free(pattern);
+  if (results) {
+    SMARTLIST_FOREACH(results, char *, f, tor_free(f));
+    smartlist_free(results);
+  }
+#else /* !defined(HAVE_GLOB) */
+  tt_skip();
+ done:
+  return;
+#endif /* defined(HAVE_GLOB) */
+}
+
+static void
 test_util_parent_dir(void *ptr)
 {
   char *cp;
@@ -4101,7 +4925,8 @@ test_util_ftruncate(void *ptr)
   tt_int_op(fd, OP_GE, 0);
 
   /* Make the file be there. */
-  tt_int_op(strlen(message), OP_EQ, write_all(fd, message, strlen(message),0));
+  tt_int_op(strlen(message), OP_EQ,
+            write_all_to_fd(fd, message, strlen(message)));
   tt_int_op((int)tor_fd_getpos(fd), OP_EQ, strlen(message));
   tt_int_op(0, OP_EQ, fstat(fd, &st));
   tt_int_op((int)st.st_size, OP_EQ, strlen(message));
@@ -4114,7 +4939,7 @@ test_util_ftruncate(void *ptr)
 
   /* Replace, and see if it got replaced */
   tt_int_op(strlen(message2), OP_EQ,
-            write_all(fd, message2, strlen(message2), 0));
+            write_all_to_fd(fd, message2, strlen(message2)));
   tt_int_op((int)tor_fd_getpos(fd), OP_EQ, strlen(message2));
   tt_int_op(0, OP_EQ, fstat(fd, &st));
   tt_int_op((int)st.st_size, OP_EQ, strlen(message2));
@@ -4159,204 +4984,6 @@ test_util_load_win_lib(void *ptr)
     FreeLibrary(h);
 }
 #endif /* defined(_WIN32) */
-
-#ifndef _WIN32
-static void
-clear_hex_errno(char *hex_errno)
-{
-  memset(hex_errno, '\0', HEX_ERRNO_SIZE + 1);
-}
-
-static void
-test_util_exit_status(void *ptr)
-{
-  /* Leave an extra byte for a \0 so we can do string comparison */
-  char hex_errno[HEX_ERRNO_SIZE + 1];
-  int n;
-
-  (void)ptr;
-
-  clear_hex_errno(hex_errno);
-  tt_str_op("",OP_EQ, hex_errno);
-
-  clear_hex_errno(hex_errno);
-  n = format_helper_exit_status(0, 0, hex_errno);
-  tt_str_op("0/0\n",OP_EQ, hex_errno);
-  tt_int_op(n,OP_EQ, strlen(hex_errno));
-
-#if SIZEOF_INT == 4
-
-  clear_hex_errno(hex_errno);
-  n = format_helper_exit_status(0, 0x7FFFFFFF, hex_errno);
-  tt_str_op("0/7FFFFFFF\n",OP_EQ, hex_errno);
-  tt_int_op(n,OP_EQ, strlen(hex_errno));
-
-  clear_hex_errno(hex_errno);
-  n = format_helper_exit_status(0xFF, -0x80000000, hex_errno);
-  tt_str_op("FF/-80000000\n",OP_EQ, hex_errno);
-  tt_int_op(n,OP_EQ, strlen(hex_errno));
-  tt_int_op(n,OP_EQ, HEX_ERRNO_SIZE);
-
-#elif SIZEOF_INT == 8
-
-  clear_hex_errno(hex_errno);
-  n = format_helper_exit_status(0, 0x7FFFFFFFFFFFFFFF, hex_errno);
-  tt_str_op("0/7FFFFFFFFFFFFFFF\n",OP_EQ, hex_errno);
-  tt_int_op(n,OP_EQ, strlen(hex_errno));
-
-  clear_hex_errno(hex_errno);
-  n = format_helper_exit_status(0xFF, -0x8000000000000000, hex_errno);
-  tt_str_op("FF/-8000000000000000\n",OP_EQ, hex_errno);
-  tt_int_op(n,OP_EQ, strlen(hex_errno));
-  tt_int_op(n,OP_EQ, HEX_ERRNO_SIZE);
-
-#endif /* SIZEOF_INT == 4 || ... */
-
-  clear_hex_errno(hex_errno);
-  n = format_helper_exit_status(0x7F, 0, hex_errno);
-  tt_str_op("7F/0\n",OP_EQ, hex_errno);
-  tt_int_op(n,OP_EQ, strlen(hex_errno));
-
-  clear_hex_errno(hex_errno);
-  n = format_helper_exit_status(0x08, -0x242, hex_errno);
-  tt_str_op("8/-242\n",OP_EQ, hex_errno);
-  tt_int_op(n,OP_EQ, strlen(hex_errno));
-
-  clear_hex_errno(hex_errno);
-  tt_str_op("",OP_EQ, hex_errno);
-
- done:
-  ;
-}
-#endif /* !defined(_WIN32) */
-
-#ifndef _WIN32
-static void
-test_util_string_from_pipe(void *ptr)
-{
-  int test_pipe[2] = {-1, -1};
-  int retval = 0;
-  enum stream_status status = IO_STREAM_TERM;
-  ssize_t retlen;
-  char buf[4] = { 0 };
-
-  (void)ptr;
-
-  errno = 0;
-
-  /* Set up a pipe to test on */
-  retval = pipe(test_pipe);
-  tt_int_op(retval, OP_EQ, 0);
-
-  /* Send in a string. */
-  retlen = write(test_pipe[1], "ABC", 3);
-  tt_int_op(retlen, OP_EQ, 3);
-
-  status = get_string_from_pipe(test_pipe[0], buf, sizeof(buf)-1);
-  tt_int_op(errno, OP_EQ, 0);
-  tt_int_op(status, OP_EQ, IO_STREAM_OKAY);
-  tt_str_op(buf, OP_EQ, "ABC");
-  errno = 0;
-
-  /* Send in a string that contains a nul. */
-  retlen = write(test_pipe[1], "AB\0", 3);
-  tt_int_op(retlen, OP_EQ, 3);
-
-  status = get_string_from_pipe(test_pipe[0], buf, sizeof(buf)-1);
-  tt_int_op(errno, OP_EQ, 0);
-  tt_int_op(status, OP_EQ, IO_STREAM_OKAY);
-  tt_str_op(buf, OP_EQ, "AB");
-  errno = 0;
-
-  /* Send in a string that contains a nul only. */
-  retlen = write(test_pipe[1], "\0", 1);
-  tt_int_op(retlen, OP_EQ, 1);
-
-  status = get_string_from_pipe(test_pipe[0], buf, sizeof(buf)-1);
-  tt_int_op(errno, OP_EQ, 0);
-  tt_int_op(status, OP_EQ, IO_STREAM_OKAY);
-  tt_str_op(buf, OP_EQ, "");
-  errno = 0;
-
-  /* Send in a string that contains a trailing newline. */
-  retlen = write(test_pipe[1], "AB\n", 3);
-  tt_int_op(retlen, OP_EQ, 3);
-
-  status = get_string_from_pipe(test_pipe[0], buf, sizeof(buf)-1);
-  tt_int_op(errno, OP_EQ, 0);
-  tt_int_op(status, OP_EQ, IO_STREAM_OKAY);
-  tt_str_op(buf, OP_EQ, "AB");
-  errno = 0;
-
-  /* Send in a string that contains a newline only. */
-  retlen = write(test_pipe[1], "\n", 1);
-  tt_int_op(retlen, OP_EQ, 1);
-
-  status = get_string_from_pipe(test_pipe[0], buf, sizeof(buf)-1);
-  tt_int_op(errno, OP_EQ, 0);
-  tt_int_op(status, OP_EQ, IO_STREAM_OKAY);
-  tt_str_op(buf, OP_EQ, "");
-  errno = 0;
-
-  /* Send in a string and check that we nul terminate return values. */
-  retlen = write(test_pipe[1], "AAA", 3);
-  tt_int_op(retlen, OP_EQ, 3);
-
-  status = get_string_from_pipe(test_pipe[0], buf, sizeof(buf)-1);
-  tt_int_op(errno, OP_EQ, 0);
-  tt_int_op(status, OP_EQ, IO_STREAM_OKAY);
-  tt_str_op(buf, OP_EQ, "AAA");
-  tt_mem_op(buf, OP_EQ, "AAA\0", sizeof(buf));
-  errno = 0;
-
-  retlen = write(test_pipe[1], "B", 1);
-  tt_int_op(retlen, OP_EQ, 1);
-
-  memset(buf, '\xff', sizeof(buf));
-  status = get_string_from_pipe(test_pipe[0], buf, sizeof(buf)-1);
-  tt_int_op(errno, OP_EQ, 0);
-  tt_int_op(status, OP_EQ, IO_STREAM_OKAY);
-  tt_str_op(buf, OP_EQ, "B");
-  tt_mem_op(buf, OP_EQ, "B\0\xff\xff", sizeof(buf));
-  errno = 0;
-
-  /* Send in multiple lines. */
-  retlen = write(test_pipe[1], "A\nB", 3);
-  tt_int_op(retlen, OP_EQ, 3);
-
-  status = get_string_from_pipe(test_pipe[0], buf, sizeof(buf)-1);
-  tt_int_op(errno, OP_EQ, 0);
-  tt_int_op(status, OP_EQ, IO_STREAM_OKAY);
-  tt_str_op(buf, OP_EQ, "A\nB");
-  errno = 0;
-
-  /* Send in a line and close */
-  retlen = write(test_pipe[1], "AB", 2);
-  tt_int_op(retlen, OP_EQ, 2);
-  retval = close(test_pipe[1]);
-  tt_int_op(retval, OP_EQ, 0);
-  test_pipe[1] = -1;
-
-  status = get_string_from_pipe(test_pipe[0], buf, sizeof(buf)-1);
-  tt_int_op(errno, OP_EQ, 0);
-  tt_int_op(status, OP_EQ, IO_STREAM_OKAY);
-  tt_str_op(buf, OP_EQ, "AB");
-  errno = 0;
-
-  /* Check for EOF */
-  status = get_string_from_pipe(test_pipe[0], buf, sizeof(buf)-1);
-  tt_int_op(errno, OP_EQ, 0);
-  tt_int_op(status, OP_EQ, IO_STREAM_CLOSED);
-  errno = 0;
-
- done:
-  if (test_pipe[0] != -1)
-    close(test_pipe[0]);
-  if (test_pipe[1] != -1)
-    close(test_pipe[1]);
-}
-
-#endif /* !defined(_WIN32) */
 
 /**
  * Test for format_hex_number_sigsafe()
@@ -4452,124 +5079,12 @@ test_util_format_dec_number(void *ptr)
   return;
 }
 
-/**
- * Test that we can properly format a Windows command line
- */
-static void
-test_util_join_win_cmdline(void *ptr)
-{
-  /* Based on some test cases from "Parsing C++ Command-Line Arguments" in
-   * MSDN but we don't exercise all quoting rules because tor_join_win_cmdline
-   * will try to only generate simple cases for the child process to parse;
-   * i.e. we never embed quoted strings in arguments. */
-
-  const char *argvs[][4] = {
-    {"a", "bb", "CCC", NULL}, // Normal
-    {NULL, NULL, NULL, NULL}, // Empty argument list
-    {"", NULL, NULL, NULL}, // Empty argument
-    {"\"a", "b\"b", "CCC\"", NULL}, // Quotes
-    {"a\tbc", "dd  dd", "E", NULL}, // Whitespace
-    {"a\\\\\\b", "de fg", "H", NULL}, // Backslashes
-    {"a\\\"b", "\\c", "D\\", NULL}, // Backslashes before quote
-    {"a\\\\b c", "d", "E", NULL}, // Backslashes not before quote
-    { NULL } // Terminator
-  };
-
-  const char *cmdlines[] = {
-    "a bb CCC",
-    "",
-    "\"\"",
-    "\\\"a b\\\"b CCC\\\"",
-    "\"a\tbc\" \"dd  dd\" E",
-    "a\\\\\\b \"de fg\" H",
-    "a\\\\\\\"b \\c D\\",
-    "\"a\\\\b c\" d E",
-    NULL // Terminator
-  };
-
-  int i;
-  char *joined_argv = NULL;
-
-  (void)ptr;
-
-  for (i=0; cmdlines[i]!=NULL; i++) {
-    log_info(LD_GENERAL, "Joining argvs[%d], expecting <%s>", i, cmdlines[i]);
-    joined_argv = tor_join_win_cmdline(argvs[i]);
-    tt_str_op(cmdlines[i],OP_EQ, joined_argv);
-    tor_free(joined_argv);
-  }
-
- done:
-  tor_free(joined_argv);
-}
-
 #define MAX_SPLIT_LINE_COUNT 4
 struct split_lines_test_t {
   const char *orig_line; // Line to be split (may contain \0's)
   int orig_length; // Length of orig_line
   const char *split_line[MAX_SPLIT_LINE_COUNT]; // Split lines
 };
-
-/**
- * Test that we properly split a buffer into lines
- */
-static void
-test_util_split_lines(void *ptr)
-{
-  /* Test cases. orig_line of last test case must be NULL.
-   * The last element of split_line[i] must be NULL. */
-  struct split_lines_test_t tests[] = {
-    {"", 0, {NULL}},
-    {"foo", 3, {"foo", NULL}},
-    {"\n\rfoo\n\rbar\r\n", 12, {"foo", "bar", NULL}},
-    {"fo o\r\nb\tar", 10, {"fo o", "b.ar", NULL}},
-    {"\x0f""f\0o\0\n\x01""b\0r\0\r", 12, {".f.o.", ".b.r.", NULL}},
-    {"line 1\r\nline 2", 14, {"line 1", "line 2", NULL}},
-    {"line 1\r\n\r\nline 2", 16, {"line 1", "line 2", NULL}},
-    {"line 1\r\n\r\r\r\nline 2", 18, {"line 1", "line 2", NULL}},
-    {"line 1\r\n\n\n\n\rline 2", 18, {"line 1", "line 2", NULL}},
-    {"line 1\r\n\r\t\r\nline 3", 18, {"line 1", ".", "line 3", NULL}},
-    {"\n\t\r\t\nline 3", 11, {".", ".", "line 3", NULL}},
-    {NULL, 0, { NULL }}
-  };
-
-  int i, j;
-  char *orig_line=NULL;
-  smartlist_t *sl=NULL;
-
-  (void)ptr;
-
-  for (i=0; tests[i].orig_line; i++) {
-    sl = smartlist_new();
-    /* Allocate space for string and trailing NULL */
-    orig_line = tor_memdup(tests[i].orig_line, tests[i].orig_length + 1);
-    tor_split_lines(sl, orig_line, tests[i].orig_length);
-
-    j = 0;
-    log_info(LD_GENERAL, "Splitting test %d of length %d",
-             i, tests[i].orig_length);
-    SMARTLIST_FOREACH_BEGIN(sl, const char *, line) {
-      /* Check we have not got too many lines */
-      tt_int_op(MAX_SPLIT_LINE_COUNT, OP_GT, j);
-      /* Check that there actually should be a line here */
-      tt_ptr_op(tests[i].split_line[j], OP_NE, NULL);
-      log_info(LD_GENERAL, "Line %d of test %d, should be <%s>",
-               j, i, tests[i].split_line[j]);
-      /* Check that the line is as expected */
-      tt_str_op(line,OP_EQ, tests[i].split_line[j]);
-      j++;
-    } SMARTLIST_FOREACH_END(line);
-    /* Check that we didn't miss some lines */
-    tt_ptr_op(NULL,OP_EQ, tests[i].split_line[j]);
-    tor_free(orig_line);
-    smartlist_free(sl);
-    sl = NULL;
-  }
-
- done:
-  tor_free(orig_line);
-  smartlist_free(sl);
-}
 
 static void
 test_util_di_ops(void *arg)
@@ -4652,6 +5167,35 @@ test_util_di_ops(void *arg)
   tt_int_op(1, OP_EQ, safe_mem_is_zero("\0\0\0\0\0\0\0\0a", 8));
   tt_int_op(0, OP_EQ, safe_mem_is_zero("\0\0\0\0\0\0\0\0a", 9));
 
+ done:
+  ;
+}
+
+static void
+test_util_memcpy_iftrue_timei(void *arg)
+{
+  (void)arg;
+  char buf1[25];
+  char buf2[25];
+  char buf3[25];
+
+  for (int i = 0; i < 100; ++i) {
+    crypto_rand(buf1, sizeof(buf1));
+    crypto_rand(buf2, sizeof(buf2));
+    memcpy(buf3, buf1, sizeof(buf1));
+
+    /* We just copied buf1 into buf3.  Now we're going to copy buf2 into buf2,
+       iff our coin flip comes up heads. */
+    bool coinflip = crypto_rand_int(2) == 0;
+
+    memcpy_if_true_timei(coinflip, buf3, buf2, sizeof(buf3));
+
+    if (coinflip) {
+      tt_mem_op(buf3, OP_EQ, buf2, sizeof(buf2));
+    } else {
+      tt_mem_op(buf3, OP_EQ, buf1, sizeof(buf1));
+    }
+  }
  done:
   ;
 }
@@ -5376,7 +5920,7 @@ static int
 fd_is_cloexec(tor_socket_t fd)
 {
   int flags = fcntl(fd, F_GETFD, 0);
-  return (flags & FD_CLOEXEC) == FD_CLOEXEC;
+  return (flags & FD_CLOEXEC) != 0;
 }
 #endif /* defined(FD_CLOEXEC) */
 
@@ -5386,7 +5930,7 @@ static int
 fd_is_nonblocking(tor_socket_t fd)
 {
   int flags = fcntl(fd, F_GETFL, 0);
-  return (flags & O_NONBLOCK) == O_NONBLOCK;
+  return (flags & O_NONBLOCK) != 0;
 }
 #endif /* !defined(_WIN32) */
 
@@ -5522,14 +6066,24 @@ test_util_socketpair(void *arg)
     tt_skip();
   }
 #endif /* defined(__FreeBSD__) */
+#ifdef ENETUNREACH
+  if (ersatz && socketpair_result == -ENETUNREACH) {
+    /* We can also fail with -ENETUNREACH if we have no network stack at
+     * all. */
+    tt_skip();
+  }
+#endif /* defined(ENETUNREACH) */
   tt_int_op(0, OP_EQ, socketpair_result);
 
   tt_assert(SOCKET_OK(fds[0]));
   tt_assert(SOCKET_OK(fds[1]));
-  tt_int_op(get_n_open_sockets(), OP_EQ, n + 2);
+  if (ersatz)
+    tt_int_op(get_n_open_sockets(), OP_EQ, n);
+  else
+    tt_int_op(get_n_open_sockets(), OP_EQ, n + 2);
 #ifdef CAN_CHECK_CLOEXEC
-  tt_int_op(fd_is_cloexec(fds[0]), OP_EQ, 1);
-  tt_int_op(fd_is_cloexec(fds[1]), OP_EQ, 1);
+  tt_int_op(fd_is_cloexec(fds[0]), OP_EQ, !ersatz);
+  tt_int_op(fd_is_cloexec(fds[1]), OP_EQ, !ersatz);
 #endif
 #ifdef CAN_CHECK_NONBLOCK
   tt_int_op(fd_is_nonblocking(fds[0]), OP_EQ, 0);
@@ -5537,10 +6091,17 @@ test_util_socketpair(void *arg)
 #endif
 
  done:
-  if (SOCKET_OK(fds[0]))
-    tor_close_socket(fds[0]);
-  if (SOCKET_OK(fds[1]))
-    tor_close_socket(fds[1]);
+  if (ersatz) {
+    if (SOCKET_OK(fds[0]))
+      tor_close_socket_simple(fds[0]);
+    if (SOCKET_OK(fds[1]))
+      tor_close_socket_simple(fds[1]);
+  } else {
+    if (SOCKET_OK(fds[0]))
+      tor_close_socket(fds[0]);
+    if (SOCKET_OK(fds[1]))
+      tor_close_socket(fds[1]);
+  }
 }
 
 #undef SOCKET_EPROTO
@@ -5557,15 +6118,15 @@ test_util_max_mem(void *arg)
   tt_int_op(r, OP_EQ, r2);
   tt_uint_op(memory2, OP_EQ, memory1);
 
-  TT_BLATHER(("System memory: "U64_FORMAT, U64_PRINTF_ARG(memory1)));
+  TT_BLATHER(("System memory: %"TOR_PRIuSZ, (memory1)));
 
   if (r==0) {
     /* You have at least a megabyte. */
     tt_uint_op(memory1, OP_GT, (1<<20));
   } else {
     /* You do not have a petabyte. */
-#if SIZEOF_SIZE_T == SIZEOF_UINT64_T
-    tt_u64_op(memory1, OP_LT, (U64_LITERAL(1)<<50));
+#if SIZEOF_SIZE_T >= 8
+    tt_u64_op(memory1, OP_LT, (UINT64_C(1)<<50));
 #endif
   }
 
@@ -5574,47 +6135,74 @@ test_util_max_mem(void *arg)
 }
 
 static void
+test_util_dest_validation_edgecase(void *arg)
+{
+  (void)arg;
+
+  tt_assert(!string_is_valid_dest(NULL));
+  tt_assert(!string_is_valid_dest(""));
+
+  done:
+  return;
+}
+
+static void
 test_util_hostname_validation(void *arg)
 {
   (void)arg;
 
   // Lets try valid hostnames first.
-  tt_assert(string_is_valid_hostname("torproject.org"));
-  tt_assert(string_is_valid_hostname("ocw.mit.edu"));
-  tt_assert(string_is_valid_hostname("i.4cdn.org"));
-  tt_assert(string_is_valid_hostname("stanford.edu"));
-  tt_assert(string_is_valid_hostname("multiple-words-with-hypens.jp"));
+  tt_assert(string_is_valid_nonrfc_hostname("torproject.org"));
+  tt_assert(string_is_valid_nonrfc_hostname("ocw.mit.edu"));
+  tt_assert(string_is_valid_nonrfc_hostname("i.4cdn.org"));
+  tt_assert(string_is_valid_nonrfc_hostname("stanford.edu"));
+  tt_assert(string_is_valid_nonrfc_hostname("multiple-words-with-hypens.jp"));
 
   // Subdomain name cannot start with '-' or '_'.
-  tt_assert(!string_is_valid_hostname("-torproject.org"));
-  tt_assert(!string_is_valid_hostname("subdomain.-domain.org"));
-  tt_assert(!string_is_valid_hostname("-subdomain.domain.org"));
-  tt_assert(!string_is_valid_hostname("___abc.org"));
+  tt_assert(!string_is_valid_nonrfc_hostname("-torproject.org"));
+  tt_assert(!string_is_valid_nonrfc_hostname("subdomain.-domain.org"));
+  tt_assert(!string_is_valid_nonrfc_hostname("-subdomain.domain.org"));
+  tt_assert(!string_is_valid_nonrfc_hostname("___abc.org"));
 
   // Hostnames cannot contain non-alphanumeric characters.
-  tt_assert(!string_is_valid_hostname("%%domain.\\org."));
-  tt_assert(!string_is_valid_hostname("***x.net"));
-  tt_assert(!string_is_valid_hostname("\xff\xffxyz.org"));
-  tt_assert(!string_is_valid_hostname("word1 word2.net"));
+  tt_assert(!string_is_valid_nonrfc_hostname("%%domain.\\org."));
+  tt_assert(!string_is_valid_nonrfc_hostname("***x.net"));
+  tt_assert(!string_is_valid_nonrfc_hostname("\xff\xffxyz.org"));
+  tt_assert(!string_is_valid_nonrfc_hostname("word1 word2.net"));
 
   // Test workaround for nytimes.com stupidity, technically invalid,
   // but we allow it since they are big, even though they are failing to
   // comply with a ~30 year old standard.
-  tt_assert(string_is_valid_hostname("core3_euw1.fabrik.nytimes.com"));
+  tt_assert(string_is_valid_nonrfc_hostname("core3_euw1.fabrik.nytimes.com"));
 
   // Firefox passes FQDNs with trailing '.'s  directly to the SOCKS proxy,
   // which is redundant since the spec states DOMAINNAME addresses are fully
   // qualified.  While unusual, this should be tollerated.
-  tt_assert(string_is_valid_hostname("core9_euw1.fabrik.nytimes.com."));
-  tt_assert(!string_is_valid_hostname("..washingtonpost.is.better.com"));
-  tt_assert(!string_is_valid_hostname("so.is..ft.com"));
-  tt_assert(!string_is_valid_hostname("..."));
+  tt_assert(string_is_valid_nonrfc_hostname("core9_euw1.fabrik.nytimes.com."));
+  tt_assert(!string_is_valid_nonrfc_hostname(
+                                         "..washingtonpost.is.better.com"));
+  tt_assert(!string_is_valid_nonrfc_hostname("so.is..ft.com"));
+  tt_assert(!string_is_valid_nonrfc_hostname("..."));
 
   // XXX: do we allow single-label DNS names?
   // We shouldn't for SOCKS (spec says "contains a fully-qualified domain name"
-  // but only test pathologically malformed traling '.' cases for now.
-  tt_assert(!string_is_valid_hostname("."));
-  tt_assert(!string_is_valid_hostname(".."));
+  // but only test pathologically malformed trailing '.' cases for now.
+  tt_assert(!string_is_valid_nonrfc_hostname("."));
+  tt_assert(!string_is_valid_nonrfc_hostname(".."));
+
+  // IP address strings are not hostnames.
+  tt_assert(!string_is_valid_nonrfc_hostname("8.8.8.8"));
+  tt_assert(!string_is_valid_nonrfc_hostname("[2a00:1450:401b:800::200e]"));
+  tt_assert(!string_is_valid_nonrfc_hostname("2a00:1450:401b:800::200e"));
+
+  // We allow alphanumeric TLDs. For discussion, see ticket #25055.
+  tt_assert(string_is_valid_nonrfc_hostname("lucky.13"));
+  tt_assert(string_is_valid_nonrfc_hostname("luck.y13"));
+  tt_assert(string_is_valid_nonrfc_hostname("luck.y13."));
+
+  // We allow punycode TLDs. For examples, see
+  // https://data.iana.org/TLD/tlds-alpha-by-domain.txt
+  tt_assert(string_is_valid_nonrfc_hostname("example.xn--l1acc"));
 
   done:
   return;
@@ -5631,6 +6219,18 @@ test_util_ipv4_validation(void *arg)
   tt_assert(!string_is_valid_ipv4_address("abcd"));
   tt_assert(!string_is_valid_ipv4_address("300.300.300.300"));
   tt_assert(!string_is_valid_ipv4_address("8.8."));
+
+  done:
+  return;
+}
+
+static void
+test_util_ipv6_validation(void *arg)
+{
+  (void)arg;
+
+  tt_assert(string_is_valid_ipv6_address("2a00:1450:401b:800::200e"));
+  tt_assert(!string_is_valid_ipv6_address("11:22::33:44:"));
 
   done:
   return;
@@ -5688,6 +6288,20 @@ test_util_get_avail_disk_space(void *arg)
   ;
 }
 
+/** Helper: Change the atime and mtime of a file. */
+static void
+set_file_mtime(const char *fname, time_t when)
+{
+  struct utimbuf u = { when, when };
+  struct stat st;
+  tt_int_op(0, OP_EQ, utime(fname, &u));
+  tt_int_op(0, OP_EQ, stat(fname, &st));
+  /* Let's hope that utime/stat give the same second as a round-trip? */
+  tt_i64_op(st.st_mtime, OP_EQ, when);
+done:
+  ;
+}
+
 static void
 test_util_touch_file(void *arg)
 {
@@ -5705,11 +6319,7 @@ test_util_touch_file(void *arg)
   tt_i64_op(st.st_mtime, OP_GE, now - 1);
 
   const time_t five_sec_ago = now - 5;
-  struct utimbuf u = { five_sec_ago, five_sec_ago };
-  tt_int_op(0, OP_EQ, utime(fname, &u));
-  tt_int_op(0, OP_EQ, stat(fname, &st));
-  /* Let's hope that utime/stat give the same second as a round-trip? */
-  tt_i64_op(st.st_mtime, OP_EQ, five_sec_ago);
+  set_file_mtime(fname, five_sec_ago);
 
   /* Finally we can touch the file */
   tt_int_op(0, OP_EQ, touch_file(fname));
@@ -5720,7 +6330,7 @@ test_util_touch_file(void *arg)
   ;
 }
 
-#ifndef _WIN32
+#ifndef DISABLE_PWDB_TESTS
 static void
 test_util_pwdb(void *arg)
 {
@@ -5792,7 +6402,7 @@ test_util_pwdb(void *arg)
   tor_free(dir);
   teardown_capture_of_logs();
 }
-#endif /* !defined(_WIN32) */
+#endif /* !defined(DISABLE_PWDB_TESTS) */
 
 static void
 test_util_calloc_check(void *arg)
@@ -5879,6 +6489,13 @@ test_util_monotonic_time(void *arg)
     monotime_coarse_stamp_units_to_approx_msec(stamp2-stamp1);
   tt_u64_op(coarse_stamp_diff, OP_GE, 120);
   tt_u64_op(coarse_stamp_diff, OP_LE, 1200);
+
+  {
+    uint64_t units = monotime_msec_to_approx_coarse_stamp_units(5000);
+    uint64_t ms = monotime_coarse_stamp_units_to_approx_msec(units);
+    tt_u64_op(ms, OP_GE, 4950);
+    tt_u64_op(ms, OP_LT, 5050);
+  }
 
  done:
   ;
@@ -6001,6 +6618,9 @@ test_util_monotonic_time_add_msec(void *arg)
   monotime_coarse_add_msec(&ct2, &ct1, 1337);
   tt_i64_op(monotime_diff_msec(&t1, &t2), OP_EQ, 1337);
   tt_i64_op(monotime_coarse_diff_msec(&ct1, &ct2), OP_EQ, 1337);
+  // The 32-bit variant must be within 1% of the regular one.
+  tt_int_op(monotime_coarse_diff_msec32_(&ct1, &ct2), OP_GT, 1323);
+  tt_int_op(monotime_coarse_diff_msec32_(&ct1, &ct2), OP_LT, 1350);
 
   /* Add 1337 msec twice more; make sure that any second rollover issues
    * worked. */
@@ -6010,6 +6630,33 @@ test_util_monotonic_time_add_msec(void *arg)
   monotime_coarse_add_msec(&ct2, &ct2, 1337);
   tt_i64_op(monotime_diff_msec(&t1, &t2), OP_EQ, 1337*3);
   tt_i64_op(monotime_coarse_diff_msec(&ct1, &ct2), OP_EQ, 1337*3);
+  tt_int_op(monotime_coarse_diff_msec32_(&ct1, &ct2), OP_GT, 3970);
+  tt_int_op(monotime_coarse_diff_msec32_(&ct1, &ct2), OP_LT, 4051);
+
+ done:
+  ;
+}
+
+static void
+test_util_nowrap_math(void *arg)
+{
+  (void)arg;
+
+  tt_u64_op(0, OP_EQ, tor_add_u32_nowrap(0, 0));
+  tt_u64_op(1, OP_EQ, tor_add_u32_nowrap(0, 1));
+  tt_u64_op(1, OP_EQ, tor_add_u32_nowrap(1, 0));
+  tt_u64_op(4, OP_EQ, tor_add_u32_nowrap(2, 2));
+  tt_u64_op(UINT32_MAX, OP_EQ, tor_add_u32_nowrap(UINT32_MAX-1, 2));
+  tt_u64_op(UINT32_MAX, OP_EQ, tor_add_u32_nowrap(2, UINT32_MAX-1));
+  tt_u64_op(UINT32_MAX, OP_EQ, tor_add_u32_nowrap(UINT32_MAX, UINT32_MAX));
+
+  tt_u64_op(0, OP_EQ, tor_mul_u64_nowrap(0, 0));
+  tt_u64_op(1, OP_EQ, tor_mul_u64_nowrap(1, 1));
+  tt_u64_op(2, OP_EQ, tor_mul_u64_nowrap(2, 1));
+  tt_u64_op(4, OP_EQ, tor_mul_u64_nowrap(2, 2));
+  tt_u64_op(UINT64_MAX, OP_EQ, tor_mul_u64_nowrap(UINT64_MAX, 1));
+  tt_u64_op(UINT64_MAX, OP_EQ, tor_mul_u64_nowrap(2, UINT64_MAX));
+  tt_u64_op(UINT64_MAX, OP_EQ, tor_mul_u64_nowrap(UINT64_MAX, UINT64_MAX));
 
  done:
   ;
@@ -6120,40 +6767,168 @@ test_util_get_unquoted_path(void *arg)
   tor_free(r);
 }
 
+static void
+test_util_map_anon(void *arg)
+{
+  (void)arg;
+  char *ptr = NULL;
+  size_t sz = 16384;
+  unsigned inherit=0;
+
+  /* Basic checks. */
+  ptr = tor_mmap_anonymous(sz, 0, &inherit);
+  tt_ptr_op(ptr, OP_NE, 0);
+  tt_int_op(inherit, OP_EQ, INHERIT_RES_KEEP);
+  ptr[sz-1] = 3;
+  tt_int_op(ptr[0], OP_EQ, 0);
+  tt_int_op(ptr[sz-2], OP_EQ, 0);
+  tt_int_op(ptr[sz-1], OP_EQ, 3);
+
+  /* Try again, with a private (non-swappable) mapping. */
+  tor_munmap_anonymous(ptr, sz);
+  ptr = tor_mmap_anonymous(sz, ANONMAP_PRIVATE, &inherit);
+  tt_ptr_op(ptr, OP_NE, 0);
+  tt_int_op(inherit, OP_EQ, INHERIT_RES_KEEP);
+  ptr[sz-1] = 10;
+  tt_int_op(ptr[0], OP_EQ, 0);
+  tt_int_op(ptr[sz/2], OP_EQ, 0);
+  tt_int_op(ptr[sz-1], OP_EQ, 10);
+
+  /* Now let's test a drop-on-fork mapping. */
+  tor_munmap_anonymous(ptr, sz);
+  ptr = tor_mmap_anonymous(sz, ANONMAP_NOINHERIT, &inherit);
+  tt_ptr_op(ptr, OP_NE, 0);
+  ptr[sz-1] = 10;
+  tt_int_op(ptr[0], OP_EQ, 0);
+  tt_int_op(ptr[sz/2], OP_EQ, 0);
+  tt_int_op(ptr[sz-1], OP_EQ, 10);
+
+ done:
+  tor_munmap_anonymous(ptr, sz);
+}
+
+static void
+test_util_map_anon_nofork(void *arg)
+{
+  (void)arg;
+#ifdef _WIN32
+  /* The operating system doesn't support forking. */
+  tt_skip();
+ done:
+  ;
+#else /* !defined(_WIN32) */
+  /* We have the right OS support.  We're going to try marking the buffer as
+   * either zero-on-fork or as drop-on-fork, whichever is supported.  Then we
+   * will fork and send a byte back to the parent process.  This will either
+   * crash, or send zero. */
+
+  char *ptr = NULL;
+  const char TEST_VALUE = 0xd0;
+  size_t sz = 16384;
+  int pipefd[2] = {-1, -1};
+  unsigned inherit=0;
+
+  tor_munmap_anonymous(ptr, sz);
+  ptr = tor_mmap_anonymous(sz, ANONMAP_NOINHERIT, &inherit);
+  tt_ptr_op(ptr, OP_NE, 0);
+  memset(ptr, (uint8_t)TEST_VALUE, sz);
+
+  tt_int_op(0, OP_EQ, pipe(pipefd));
+  pid_t child = fork();
+  if (child == 0) {
+    /* We're in the child. */
+    close(pipefd[0]);
+    ssize_t r = write(pipefd[1], &ptr[sz-1], 1); /* This may crash. */
+    close(pipefd[1]);
+    if (r < 0)
+      exit(1);
+    exit(0);
+  }
+  tt_int_op(child, OP_GT, 0);
+  /* In the parent. */
+  close(pipefd[1]);
+  pipefd[1] = -1;
+  char buf[1];
+  ssize_t r = read(pipefd[0], buf, 1);
+
+  if (inherit == INHERIT_RES_ZERO) {
+    // We should be seeing clear-on-fork behavior.
+    tt_int_op((int)r, OP_EQ, 1); // child should send us a byte.
+    tt_int_op(buf[0], OP_EQ, 0); // that byte should be zero.
+  } else if (inherit == INHERIT_RES_DROP) {
+    // We should be seeing noinherit behavior.
+    tt_int_op(r, OP_LE, 0); // child said nothing; it should have crashed.
+  } else {
+    // noinherit isn't implemented.
+    tt_int_op(inherit, OP_EQ, INHERIT_RES_KEEP);
+    tt_int_op((int)r, OP_EQ, 1); // child should send us a byte.
+    tt_int_op(buf[0], OP_EQ, TEST_VALUE); // that byte should be TEST_VALUE.
+  }
+
+  int ws;
+  waitpid(child, &ws, 0);
+
+#ifndef NOINHERIT_CAN_FAIL
+  /* Only if NOINHERIT_CAN_FAIL should it be possible for us to get
+   * INHERIT_KEEP behavior in this case. */
+  tt_int_op(inherit, OP_NE, INHERIT_RES_KEEP);
+#else
+  if (inherit == INHERIT_RES_KEEP) {
+    /* Call this test "skipped", not "passed", since noinherit wasn't
+     * implemented. */
+    tt_skip();
+  }
+#endif /* !defined(NOINHERIT_CAN_FAIL) */
+
+ done:
+  tor_munmap_anonymous(ptr, sz);
+  if (pipefd[0] >= 0) {
+    close(pipefd[0]);
+  }
+  if (pipefd[1] >= 0) {
+    close(pipefd[1]);
+  }
+#endif /* defined(_WIN32) */
+}
+
+#ifndef COCCI
 #define UTIL_LEGACY(name)                                               \
-  { #name, test_util_ ## name , 0, NULL, NULL }
+  { (#name), test_util_ ## name , 0, NULL, NULL }
 
 #define UTIL_TEST(name, flags)                          \
-  { #name, test_util_ ## name, flags, NULL, NULL }
+  { (#name), test_util_ ## name, flags, NULL, NULL }
 
 #define COMPRESS(name, identifier)              \
-  { "compress/" #name, test_util_compress, 0, &compress_setup,          \
+  { ("compress/" #name), test_util_compress, 0, &compress_setup,        \
     (char*)(identifier) }
 
 #define COMPRESS_CONCAT(name, identifier)                               \
-  { "compress_concat/" #name, test_util_decompress_concatenated, 0,     \
+  { ("compress_concat/" #name), test_util_decompress_concatenated, 0,   \
     &compress_setup,                                                    \
     (char*)(identifier) }
 
 #define COMPRESS_JUNK(name, identifier)                                 \
-  { "compress_junk/" #name, test_util_decompress_junk, 0,               \
+  { ("compress_junk/" #name), test_util_decompress_junk, 0,             \
     &compress_setup,                                                    \
     (char*)(identifier) }
 
 #define COMPRESS_DOS(name, identifier)                                  \
-  { "compress_dos/" #name, test_util_decompress_dos, 0,                 \
+  { ("compress_dos/" #name), test_util_decompress_dos, 0,               \
     &compress_setup,                                                    \
     (char*)(identifier) }
 
 #ifdef _WIN32
-#define UTIL_TEST_NO_WIN(n, f) { #n, NULL, TT_SKIP, NULL, NULL }
 #define UTIL_TEST_WIN_ONLY(n, f) UTIL_TEST(n, (f))
-#define UTIL_LEGACY_NO_WIN(n) UTIL_TEST_NO_WIN(n, 0)
 #else
-#define UTIL_TEST_NO_WIN(n, f) UTIL_TEST(n, (f))
-#define UTIL_TEST_WIN_ONLY(n, f) { #n, NULL, TT_SKIP, NULL, NULL }
-#define UTIL_LEGACY_NO_WIN(n) UTIL_LEGACY(n)
-#endif /* defined(_WIN32) */
+#define UTIL_TEST_WIN_ONLY(n, f) { (#n), NULL, TT_SKIP, NULL, NULL }
+#endif
+
+#ifdef DISABLE_PWDB_TESTS
+#define UTIL_TEST_PWDB(n, f) { (#n), NULL, TT_SKIP, NULL, NULL }
+#else
+#define UTIL_TEST_PWDB(n, f) UTIL_TEST(n, (f))
+#endif
+#endif /* !defined(COCCI) */
 
 struct testcase_t util_tests[] = {
   UTIL_LEGACY(time),
@@ -6163,7 +6938,8 @@ struct testcase_t util_tests[] = {
   UTIL_LEGACY(config_line_comment_character),
   UTIL_LEGACY(config_line_escaped_content),
   UTIL_LEGACY(config_line_crlf),
-  UTIL_LEGACY_NO_WIN(expand_filename),
+  UTIL_TEST(config_line_partition, 0),
+  UTIL_TEST_PWDB(expand_filename, 0),
   UTIL_LEGACY(escape_string_socks),
   UTIL_LEGACY(string_is_key_value),
   UTIL_LEGACY(strmisc),
@@ -6199,24 +6975,26 @@ struct testcase_t util_tests[] = {
   UTIL_LEGACY(path_is_relative),
   UTIL_LEGACY(strtok),
   UTIL_LEGACY(di_ops),
+  UTIL_TEST(memcpy_iftrue_timei, 0),
   UTIL_TEST(di_map, 0),
   UTIL_TEST(round_to_next_multiple_of, 0),
   UTIL_TEST(laplace, 0),
   UTIL_TEST(clamp_double_to_int64, 0),
   UTIL_TEST(find_str_at_start_of_line, 0),
+  UTIL_TEST(tor_strreplacechar, 0),
   UTIL_TEST(string_is_C_identifier, 0),
+  UTIL_TEST(string_is_utf8, 0),
   UTIL_TEST(asprintf, 0),
   UTIL_TEST(listdir, 0),
+  UTIL_TEST(glob, 0),
+  UTIL_TEST(get_glob_opened_files, 0),
   UTIL_TEST(parent_dir, 0),
   UTIL_TEST(ftruncate, 0),
+  UTIL_TEST(nowrap_math, 0),
   UTIL_TEST(num_cpus, 0),
   UTIL_TEST_WIN_ONLY(load_win_lib, 0),
-  UTIL_TEST_NO_WIN(exit_status, 0),
-  UTIL_TEST_NO_WIN(string_from_pipe, 0),
   UTIL_TEST(format_hex_number, 0),
   UTIL_TEST(format_dec_number, 0),
-  UTIL_TEST(join_win_cmdline, 0),
-  UTIL_TEST(split_lines, 0),
   UTIL_TEST(n_bits_set, 0),
   UTIL_TEST(eat_whitespace, 0),
   UTIL_TEST(sl_new_from_text_lines, 0),
@@ -6229,10 +7007,13 @@ struct testcase_t util_tests[] = {
   UTIL_TEST(read_file_eof_two_loops, 0),
   UTIL_TEST(read_file_eof_two_loops_b, 0),
   UTIL_TEST(read_file_eof_zero_bytes, 0),
+  UTIL_TEST(read_file_endlines, 0),
   UTIL_TEST(write_chunks_to_file, 0),
+  UTIL_TEST(write_str_if_changed, 0),
   UTIL_TEST(mathlog, 0),
   UTIL_TEST(fraction, 0),
   UTIL_TEST(weak_random, 0),
+  { "tor_isinf", test_tor_isinf, TT_FORK, NULL, NULL },
   { "socket_ipv4", test_util_socket, TT_FORK, &passthrough_setup,
     (void*)"4" },
   { "socket_ipv6", test_util_socket, TT_FORK,
@@ -6243,11 +7024,13 @@ struct testcase_t util_tests[] = {
     &passthrough_setup, (void*)"1" },
   UTIL_TEST(max_mem, 0),
   UTIL_TEST(hostname_validation, 0),
+  UTIL_TEST(dest_validation_edgecase, 0),
   UTIL_TEST(ipv4_validation, 0),
+  UTIL_TEST(ipv6_validation, 0),
   UTIL_TEST(writepid, 0),
   UTIL_TEST(get_avail_disk_space, 0),
   UTIL_TEST(touch_file, 0),
-  UTIL_TEST_NO_WIN(pwdb, TT_FORK),
+  UTIL_TEST_PWDB(pwdb, TT_FORK),
   UTIL_TEST(calloc_check, 0),
   UTIL_TEST(monotonic_time, 0),
   UTIL_TEST(monotonic_time_ratchet, TT_FORK),
@@ -6255,6 +7038,7 @@ struct testcase_t util_tests[] = {
   UTIL_TEST(monotonic_time_add_msec, 0),
   UTIL_TEST(htonll, 0),
   UTIL_TEST(get_unquoted_path, 0),
+  UTIL_TEST(map_anon, 0),
+  UTIL_TEST(map_anon_nofork, 0),
   END_OF_TESTCASES
 };
-

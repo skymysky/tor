@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# Copyright 2017, The Tor Project, Inc
+# Copyright 2017-2019, The Tor Project, Inc
 # See LICENSE for licensing information
 
 """
@@ -41,6 +41,11 @@ The whole logic and concept for this test suite was taken from ntor_ref.py.
                 *** DO NOT USE THIS IN PRODUCTION. ***
 """
 
+# Future imports for Python 2.7, mandatory in 3.0
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 import struct
 import os, sys
 import binascii
@@ -65,14 +70,16 @@ except ImportError:
 try:
     # Pull the sha3 functions in.
     from hashlib import sha3_256, shake_256
-    shake_squeeze = shake_256.digest
+    def shake_squeeze(obj, n):
+        return obj.digest(n)
 except ImportError:
     if hasattr(sha3, "SHA3256"):
         # If this happens, then we have the old "sha3" module which
         # hashlib and pysha3 superseded.
         sha3_256 = sha3.SHA3256
         shake_256 = sha3.SHAKE256
-        shake_squeeze = shake_256.squeeze
+        def shake_squeeze(obj, n):
+            return obj.squeeze(n)
     else:
         # error code 77 tells automake to skip this test
         sys.exit(77)
@@ -234,8 +241,11 @@ Utilities for communicating with the little-t-tor ntor wrapper to conduct the
 integration tests
 """
 
-PROG = b"./src/test/test-hs-ntor-cl"
-enhex=lambda s: binascii.b2a_hex(s)
+PROG = "./src/test/test-hs-ntor-cl"
+if sys.version_info[0] >= 3:
+    enhex=lambda s: binascii.b2a_hex(s).decode("ascii")
+else:
+    enhex=lambda s: binascii.b2a_hex(s)
 dehex=lambda s: binascii.a2b_hex(s.strip())
 
 def tor_client1(intro_auth_pubkey_str, intro_enc_pubkey,

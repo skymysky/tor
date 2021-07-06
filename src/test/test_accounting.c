@@ -1,17 +1,15 @@
-/* Copyright (c) 2014-2017, The Tor Project, Inc. */
+/* Copyright (c) 2014-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
-#include "or.h"
-#include "test.h"
+#include "core/or/or.h"
+#include "test/test.h"
 #define HIBERNATE_PRIVATE
-#include "hibernate.h"
-#include "config.h"
+#include "feature/hibernate/hibernate.h"
+#include "app/config/config.h"
 #define STATEFILE_PRIVATE
-#include "statefile.h"
+#include "app/config/statefile.h"
 
-#define NS_MODULE accounting
-
-#define NS_SUBMODULE limits
+#include "app/config/or_state_st.h"
 
 /*
  * Test to make sure accounting triggers hibernation
@@ -19,9 +17,10 @@
  */
 
 static or_state_t *or_state;
-NS_DECL(or_state_t *, get_or_state, (void));
+static or_state_t * acct_limits_get_or_state(void);
+ATTR_UNUSED static int acct_limits_get_or_state_called = 0;
 static or_state_t *
-NS(get_or_state)(void)
+acct_limits_get_or_state(void)
 {
   return or_state;
 }
@@ -33,7 +32,8 @@ test_accounting_limits(void *arg)
   time_t fake_time = time(NULL);
   (void) arg;
 
-  NS_MOCK(get_or_state);
+  MOCK(get_or_state,
+       acct_limits_get_or_state);
   or_state = or_state_new();
 
   options->AccountingMax = 100;
@@ -92,14 +92,11 @@ test_accounting_limits(void *arg)
 
   goto done;
  done:
-  NS_UNMOCK(get_or_state);
+  UNMOCK(get_or_state);
   or_state_free(or_state);
 }
-
-#undef NS_SUBMODULE
 
 struct testcase_t accounting_tests[] = {
   { "bwlimits", test_accounting_limits, TT_FORK, NULL, NULL },
   END_OF_TESTCASES
 };
-

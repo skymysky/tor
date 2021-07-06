@@ -1,23 +1,25 @@
-/* Copyright (c) 2014-2017, The Tor Project, Inc. */
+/* Copyright (c) 2014-2021, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
-#define DIRSERV_PRIVATE
-#define ROUTERPARSE_PRIVATE
+#define GUARDFRACTION_PRIVATE
 #define NETWORKSTATUS_PRIVATE
+#define NS_PARSE_PRIVATE
 
 #include "orconfig.h"
-#include "or.h"
-#include "config.h"
-#include "dirserv.h"
-#include "container.h"
-#include "entrynodes.h"
-#include "util.h"
-#include "routerparse.h"
-#include "networkstatus.h"
+#include "core/or/or.h"
+#include "app/config/config.h"
+#include "feature/dirauth/guardfraction.h"
+#include "feature/client/entrynodes.h"
+#include "feature/dirparse/ns_parse.h"
+#include "feature/nodelist/networkstatus.h"
 
-#include "test.h"
-#include "test_helpers.h"
-#include "log_test_helpers.h"
+#include "feature/nodelist/networkstatus_st.h"
+#include "feature/dirauth/vote_microdesc_hash_st.h"
+#include "feature/nodelist/vote_routerstatus_st.h"
+
+#include "test/test.h"
+#include "test/test_helpers.h"
+#include "test/log_test_helpers.h"
 
 /** Generate a vote_routerstatus_t for a router with identity digest
  * <b>digest_in_hex</b>. */
@@ -49,9 +51,9 @@ gen_vote_routerstatus_for_tests(const char *digest_in_hex, int is_guard)
     vrs->version = tor_strdup("0.1.2.14");
     strlcpy(rs->nickname, "router2", sizeof(rs->nickname));
     memset(rs->descriptor_digest, 78, DIGEST_LEN);
-    rs->addr = 0x99008801;
-    rs->or_port = 443;
-    rs->dir_port = 8000;
+    tor_addr_from_ipv4h(&rs->ipv4_addr, 0x99008801);
+    rs->ipv4_orport = 443;
+    rs->ipv4_dirport = 8000;
     /* all flags but running cleared */
     rs->is_flagged_running = 1;
     vrs->has_measured_bw = 1;
@@ -420,4 +422,3 @@ struct testcase_t guardfraction_tests[] = {
 
   END_OF_TESTCASES
 };
-

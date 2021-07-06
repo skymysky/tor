@@ -6,6 +6,7 @@
 *.swo
 # C stuff
 *.o
+*.a
 *.obj
 # Diff droppings
 *.orig
@@ -36,6 +37,12 @@ details-*.json
 uptime-*.json
 *.full_url
 *.last_modified
+# Core files
+core
+core.*
+!core/
+# ccls file that can be per directory.
+*.ccls
 
 # /
 /Makefile
@@ -45,6 +52,7 @@ uptime-*.json
 /autom4te.cache
 /build-stamp
 /compile
+/config.rust
 /configure
 /Doxyfile
 /orconfig.h
@@ -55,6 +63,7 @@ uptime-*.json
 /config.guess
 /config.sub
 /conftest*
+/link_rust.sh
 /micro-revision.*
 /patch-stamp
 /stamp-h
@@ -70,15 +79,16 @@ uptime-*.json
 /mkinstalldirs
 /Tor*Bundle.dmg
 /tor-*-win32.exe
+/warning_flags
+/compile_commands.json
+
 /coverage_html/
 /callgraph/
 
 # /contrib/
-/contrib/dist/tor.sh
 /contrib/dist/torctl
 /contrib/dist/tor.service
 /contrib/operator-tools/tor.logrotate
-/contrib/dist/suse/tor.sh
 
 # /debian/
 /debian/files
@@ -94,26 +104,31 @@ uptime-*.json
 /doc/Makefile
 /doc/Makefile.in
 /doc/doxygen
-/doc/tor.1
-/doc/tor.1.in
-/doc/tor.html
-/doc/tor.html.in
-/doc/tor.1.xml
-/doc/tor-gencert.1
-/doc/tor-gencert.1.in
-/doc/tor-gencert.html
-/doc/tor-gencert.html.in
-/doc/tor-gencert.1.xml
-/doc/tor-resolve.1
-/doc/tor-resolve.1.in
-/doc/tor-resolve.html
-/doc/tor-resolve.html.in
-/doc/tor-resolve.1.xml
-/doc/torify.1
-/doc/torify.1.in
-/doc/torify.html
-/doc/torify.html.in
-/doc/torify.1.xml
+/doc/man/tor.1
+/doc/man/tor.1.in
+/doc/man/tor.html
+/doc/man/tor.html.in
+/doc/man/tor.1.xml
+/doc/man/tor-gencert.1
+/doc/man/tor-gencert.1.in
+/doc/man/tor-gencert.html
+/doc/man/tor-gencert.html.in
+/doc/man/tor-gencert.1.xml
+/doc/man/tor-resolve.1
+/doc/man/tor-resolve.1.in
+/doc/man/tor-resolve.html
+/doc/man/tor-resolve.html.in
+/doc/man/tor-resolve.1.xml
+/doc/man/torify.1
+/doc/man/torify.1.in
+/doc/man/torify.html
+/doc/man/torify.html.in
+/doc/man/torify.1.xml
+/doc/man/tor-print-ed-signing-cert.1
+/doc/man/tor-print-ed-signing-cert.1.in
+/doc/man/tor-print-ed-signing-cert.html
+/doc/man/tor-print-ed-signing-cert.html.in
+/doc/man/tor-print-ed-signing-cert.1.xml
 
 # /doc/spec/
 /doc/spec/Makefile
@@ -127,27 +142,6 @@ uptime-*.json
 /src/Makefile
 /src/Makefile.in
 
-# /src/trace
-/src/trace/libor-trace.a
-
-# /src/common/
-/src/common/Makefile
-/src/common/Makefile.in
-/src/common/libor.a
-/src/common/libor-testing.a
-/src/common/libor.lib
-/src/common/libor-ctime.a
-/src/common/libor-ctime-testing.a
-/src/common/libor-ctime.lib
-/src/common/libor-crypto.a
-/src/common/libor-crypto-testing.a
-/src/common/libor-crypto.lib
-/src/common/libor-event.a
-/src/common/libor-event-testing.a
-/src/common/libor-event.lib
-/src/common/libcurve25519_donna.a
-/src/common/libcurve25519_donna.lib
-
 # /src/config/
 /src/config/Makefile
 /src/config/Makefile.in
@@ -157,23 +151,15 @@ uptime-*.json
 /src/config/torrc.minimal
 
 # /src/ext/
-/src/ext/ed25519/ref10/libed25519_ref10.a
 /src/ext/ed25519/ref10/libed25519_ref10.lib
-/src/ext/ed25519/donna/libed25519_donna.a
 /src/ext/ed25519/donna/libed25519_donna.lib
-/src/ext/keccak-tiny/libkeccak-tiny.a
 /src/ext/keccak-tiny/libkeccak-tiny.lib
 
-# /src/or/
-/src/or/Makefile
-/src/or/Makefile.in
-/src/or/tor
-/src/or/tor.exe
-/src/or/tor-cov
-/src/or/tor-cov.exe
-/src/or/libtor.a
-/src/or/libtor-testing.a
-/src/or/libtor.lib
+# /src/app
+/src/app/tor
+/src/app/tor.exe
+/src/app/tor-cov
+/src/app/tor-cov.exe
 
 # /src/rust
 /src/rust/.cargo/config
@@ -189,20 +175,22 @@ uptime-*.json
 /src/test/test
 /src/test/test-slow
 /src/test/test-bt-cl
-/src/test/test-child
+/src/test/test-process
 /src/test/test-memwipe
 /src/test/test-ntor-cl
 /src/test/test-hs-ntor-cl
+/src/test/test-rng
 /src/test/test-switch-id
 /src/test/test-timers
 /src/test/test_workqueue
 /src/test/test.exe
 /src/test/test-slow.exe
 /src/test/test-bt-cl.exe
-/src/test/test-child.exe
+/src/test/test-process.exe
 /src/test/test-ntor-cl.exe
 /src/test/test-hs-ntor-cl.exe
 /src/test/test-memwipe.exe
+/src/test/test-rng.exe
 /src/test/test-switch-id.exe
 /src/test/test-timers.exe
 /src/test/test_workqueue.exe
@@ -212,11 +200,12 @@ uptime-*.json
 /src/test/fuzz/lf-fuzz-*
 
 # /src/tools/
-/src/tools/libtorrunner.a
 /src/tools/tor-checkkey
 /src/tools/tor-resolve
 /src/tools/tor-cov-resolve
 /src/tools/tor-gencert
+/src/tools/tor-print-ed-signing-cert
+/src/tools/tor-print-ed-signing-cert.exe
 /src/tools/tor-cov-gencert
 /src/tools/tor-checkkey.exe
 /src/tools/tor-resolve.exe
@@ -225,10 +214,6 @@ uptime-*.json
 /src/tools/tor-cov-gencert.exe
 /src/tools/Makefile
 /src/tools/Makefile.in
-
-# /src/trunnel/
-/src/trunnel/libor-trunnel-testing.a
-/src/trunnel/libor-trunnel.a
 
 # /src/win32/
 /src/win32/Makefile

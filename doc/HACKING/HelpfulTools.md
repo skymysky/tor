@@ -1,43 +1,64 @@
-Useful tools
-============
+# Useful tools
 
 These aren't strictly necessary for hacking on Tor, but they can help track
 down bugs.
 
-Jenkins
--------
+## Travis/Appveyor CI
 
-    https://jenkins.torproject.org
+It's CI.
 
-Dmalloc
--------
+Looks like this:
+* https://travis-ci.org/torproject/tor
+* https://ci.appveyor.com/project/torproject/tor
 
-The dmalloc library will keep track of memory allocation, so you can find out
-if we're leaking memory, doing any double-frees, or so on.
+Travis builds and runs tests on Linux, and eventually macOS (#24629).
+Appveyor builds and runs tests on Windows (using Windows Services for Linux).
 
-    dmalloc -l -/dmalloc.log
-    (run the commands it tells you)
-    ./configure --with-dmalloc
+Runs automatically on Pull Requests sent to torproject/tor. You can set it up
+for your fork to build commits outside of PRs too:
 
-Valgrind
---------
+1. sign up for GitHub: https://github.com/join
+2. fork https://github.com/torproject/tor:
+   https://help.github.com/articles/fork-a-repo/
+3. follow https://docs.travis-ci.com/user/getting-started/#To-get-started-with-Travis-CI.
+   skip steps involving `.travis.yml` (we already have one).
+4. go to https://ci.appveyor.com/login , log in with github, and select
+   "NEW PROJECT"
 
-    valgrind --leak-check=yes --error-limit=no --show-reachable=yes src/or/tor
+Builds should show up on the web at travis-ci.com and on IRC at #tor-ci on
+OFTC. If they don't, ask #tor-dev (also on OFTC).
+
+## Jenkins
+
+It's CI/builders. Looks like this: https://jenkins.torproject.org
+
+Runs automatically on commits merged to git.torproject.org. We CI the
+master branch and all supported tor versions. We also build nightly debian
+packages from master.
+
+Builds Linux and Windows cross-compilation. Runs Linux tests.
+
+Builds should show up on the web at jenkins.torproject.org and on IRC at
+#tor-bots on OFTC. If they don't, ask #tor-dev (also on OFTC).
+
+## Valgrind
+
+```console
+$ valgrind --leak-check=yes --error-limit=no --show-reachable=yes src/app/tor
+```
 
 (Note that if you get a zillion openssl warnings, you will also need to
 pass `--undef-value-errors=no` to valgrind, or rebuild your openssl
 with `-DPURIFY`.)
 
-Coverity
---------
+## Coverity
 
 Nick regularly runs the coverity static analyzer on the Tor codebase.
 
 The preprocessor define `__COVERITY__` is used to work around instances
 where coverity picks up behavior that we wish to permit.
 
-clang Static Analyzer
----------------------
+## clang Static Analyzer
 
 The clang static analyzer can be run on the Tor codebase using Xcode (WIP)
 or a command-line build.
@@ -45,8 +66,7 @@ or a command-line build.
 The preprocessor define `__clang_analyzer__` is used to work around instances
 where clang picks up behavior that we wish to permit.
 
-clang Runtime Sanitizers
-------------------------
+## clang Runtime Sanitizers
 
 To build the Tor codebase with the clang Address and Undefined Behavior
 sanitizers, see the file `contrib/clang/sanitize_blacklist.txt`.
@@ -54,16 +74,17 @@ sanitizers, see the file `contrib/clang/sanitize_blacklist.txt`.
 Preprocessor workarounds for instances where clang picks up behavior that
 we wish to permit are also documented in the blacklist file.
 
-Running lcov for unit test coverage
------------------------------------
+## Running lcov for unit test coverage
 
 Lcov is a utility that generates pretty HTML reports of test code coverage.
 To generate such a report:
 
-    ./configure --enable-coverage
-    make
-    make coverage-html
-    $BROWSER ./coverage_html/index.html
+```console
+$ ./configure --enable-coverage
+$ make
+$ make coverage-html
+$ $BROWSER ./coverage_html/index.html
+```
 
 This will run the tor unit test suite `./src/test/test` and generate the HTML
 coverage code report under the directory `./coverage_html/`. To change the
@@ -72,42 +93,52 @@ output directory, use `make coverage-html HTML_COVER_DIR=./funky_new_cov_dir`.
 Coverage diffs using lcov are not currently implemented, but are being
 investigated (as of July 2014).
 
-Running the unit tests
-----------------------
+## Running the unit tests
 
 To quickly run all the tests distributed with Tor:
 
-    make check
+```console
+$ make check
+```
 
 To run the fast unit tests only:
 
-    make test
+```console
+$ make test
+```
 
 To selectively run just some tests (the following can be combined
 arbitrarily):
 
-    ./src/test/test <name_of_test> [<name of test 2>] ...
-    ./src/test/test <prefix_of_name_of_test>.. [<prefix_of_name_of_test2>..] ...
-    ./src/test/test :<name_of_excluded_test> [:<name_of_excluded_test2]...
+```console
+$ ./src/test/test <name_of_test> [<name of test 2>] ...
+$ ./src/test/test <prefix_of_name_of_test>.. [<prefix_of_name_of_test2>..] ...
+$ ./src/test/test :<name_of_excluded_test> [:<name_of_excluded_test2]...
+```
 
 To run all tests, including those based on Stem or Chutney:
 
-    make test-full
+```console
+$ make test-full
+```
 
 To run all tests, including those based on Stem or Chutney that require a
 working connection to the internet:
 
-    make test-full-online
+```console
+$ make test-full-online
+```
 
-Running gcov for unit test coverage
------------------------------------
+## Running gcov for unit test coverage
 
-    ./configure --enable-coverage
-    make
-    make check
-    # or--- make test-full ? make test-full-online?
-    mkdir coverage-output
-    ./scripts/test/coverage coverage-output
+```console
+$ ./configure --enable-coverage
+$ make
+$ make check
+$ # or--- make test-full ? make test-full-online?
+$ mkdir coverage-output
+$ ./scripts/test/coverage coverage-output
+```
 
 (On OSX, you'll need to start with `--enable-coverage CC=clang`.)
 
@@ -130,7 +161,9 @@ you can run `make reset-gcov` to clear the intermediary gcov output.
 If you have two different `coverage-output` directories, and you want to see
 a meaningful diff between them, you can run:
 
-    ./scripts/test/cov-diff coverage-output1 coverage-output2 | less
+```console
+$ ./scripts/test/cov-diff coverage-output1 coverage-output2 | less
+```
 
 In this diff, any lines that were visited at least once will have coverage "1",
 and line numbers are deleted.  This lets you inspect what you (probably) really
@@ -140,8 +173,7 @@ lines?
 If you run ./scripts/test/cov-exclude, it marks excluded unreached
 lines with 'x', and excluded reached lines with '!!!'.
 
-Running integration tests
--------------------------
+## Running integration tests
 
 We have the beginnings of a set of scripts to run integration tests using
 Chutney. To try them, set CHUTNEY_PATH to your chutney source directory, and
@@ -150,14 +182,12 @@ run `make test-network`.
 We also have scripts to run integration tests using Stem.  To try them, set
 `STEM_SOURCE_DIR` to your Stem source directory, and run `test-stem`.
 
-Profiling Tor
--------------
+## Profiling Tor
 
 Ongoing notes about Tor profiling can be found at
 https://pad.riseup.net/p/profiling-tor
 
-Profiling Tor with oprofile
----------------------------
+## Profiling Tor with oprofile
 
 The oprofile tool runs (on Linux only!) to tell you what functions Tor is
 spending its CPU time in, so we can identify performance bottlenecks.
@@ -182,8 +212,7 @@ Here are some basic instructions
    * `opreport -l that_dir/*`
  - Profit
 
-Profiling Tor with perf
------------------------
+## Profiling Tor with perf
 
 This works with a running Tor, and requires root.
 
@@ -212,8 +241,7 @@ This works with a running Tor, and requires root.
     report -g > <FILENAME>.out`. Then you can compress that and put it somewhere
     public.
 
-Profiling Tor with gperftools aka Google-performance-tools
-----------------------------------------------------------
+## Profiling Tor with gperftools aka Google-performance-tools
 
 This should work on nearly any unixy system. It doesn't seem to be compatible
 with RunAsDaemon though.
@@ -226,24 +254,22 @@ Beforehand, install google-perftools.
 Now you can run Tor with profiling enabled, and use the pprof utility to look at
 performance! See the gperftools manual for more info, but basically:
 
-2. Run `env CPUPROFILE=/tmp/profile src/or/tor -f <path/torrc>`. The profile file
-   is not written to until Tor finishes execuction.
+2. Run `env CPUPROFILE=/tmp/profile src/app/tor -f <path/torrc>`. The profile file
+   is not written to until Tor finishes execution.
 
-3. Run `pprof src/or/tor /tm/profile` to start the REPL.
+3. Run `pprof src/app/tor /tmp/profile` to start the REPL.
 
-Generating and analyzing a callgraph
-------------------------------------
+## Generating and analyzing a callgraph
 
 0. Build Tor on linux or mac, ideally with -O0 or -fno-inline.
 
-1. Clone 'https://gitweb.torproject.org/user/nickm/calltool.git/' .
+1. Clone 'https://git.torproject.org/user/nickm/calltool.git/' .
    Follow the README in that repository.
 
 Note that currently the callgraph generator can't detect calls that pass
 through function pointers.
 
-Getting emacs to edit Tor source properly
------------------------------------------
+## Getting emacs to edit Tor source properly
 
 Nick likes to put the following snippet in his .emacs file:
 
@@ -291,59 +317,107 @@ If you use emacs for editing Tor and nothing else, you could always just say:
 There is probably a better way to do this.  No, we are probably not going
 to clutter the files with emacs stuff.
 
+## Building a tag file (code index)
 
-Doxygen
--------
+Many functions in tor use `MOCK_IMPL` wrappers for unit tests. Your
+tag-building program must be told how to handle this syntax.
+
+If you're using emacs, you can generate an emacs-compatible tag file using
+`make tags`. This will run your system's `etags`. Tor's build system assumes
+that you're using the emacs-specific version of `etags` (bundled under the
+`xemacs21-bin` package on Debian). This is incompatible with other versions of
+`etags` such as the version provided by Exuberant Ctags.
+
+If you're using vim or emacs, you can also use Universal Ctags to build a tag
+file using the syntax:
+
+```console
+$ ctags -R -D 'MOCK_IMPL(r,h,a)=r h a' .
+```
+
+If you're using an older version of Universal Ctags, you can use the following
+instead:
+
+```console
+ctags -R --mline-regex-c='/MOCK_IMPL\([^,]+,\W*([a-zA-Z0-9_]+)\W*,/\1/f/{mgroup=1}' .
+```
+
+A vim-compatible tag file will be generated by default. If you use emacs, add
+the `-e` flag to generate an emacs-compatible tag file.
+
+## Doxygen
 
 We use the 'doxygen' utility to generate documentation from our
 source code. Here's how to use it:
 
   1. Begin every file that should be documented with
 
-         /**
-          * \file filename.c
-          * \brief Short description of the file.
-          */
+```
+ /**
+  * \file filename.c
+  * \brief Short description of the file.
+  */
+```
 
-     (Doxygen will recognize any comment beginning with /** as special.)
+  (Doxygen will recognize any comment beginning with /** as special.)
 
   2. Before any function, structure, #define, or variable you want to
      document, add a comment of the form:
 
-        /** Describe the function's actions in imperative sentences.
-         *
-         * Use blank lines for paragraph breaks
-         *   - and
-         *   - hyphens
-         *   - for
-         *   - lists.
-         *
-         * Write <b>argument_names</b> in boldface.
-         *
-         * \code
-         *     place_example_code();
-         *     between_code_and_endcode_commands();
-         * \endcode
-         */
+```
+/** Describe the function's actions in imperative sentences.
+ *
+ * Use blank lines for paragraph breaks
+ *   - and
+ *   - hyphens
+ *   - for
+ *   - lists.
+ *
+ * Write <b>argument_names</b> in boldface.
+ *
+ * \code
+ *     place_example_code();
+ *     between_code_and_endcode_commands();
+ * \endcode
+ */
+```
 
   3. Make sure to escape the characters `<`, `>`, `\`, `%` and `#` as `\<`,
      `\>`, `\\`, `\%` and `\#`.
 
   4. To document structure members, you can use two forms:
 
-        struct foo {
-          /** You can put the comment before an element; */
-          int a;
-          int b; /**< Or use the less-than symbol to put the comment
-                 * after the element. */
-        };
+```c
+struct foo {
+  /** You can put the comment before an element; */
+  int a;
+  int b; /**< Or use the less-than symbol to put the comment
+         * after the element. */
+};
+```
 
   5. To generate documentation from the Tor source code, type:
 
-        $ doxygen -g
+```console
+$ doxygen -g
+```
 
-     to generate a file called `Doxyfile`.  Edit that file and run
-     `doxygen` to generate the API documentation.
+  to generate a file called `Doxyfile`.  Edit that file and run
+  `doxygen` to generate the API documentation.
 
   6. See the Doxygen manual for more information; this summary just
      scratches the surface.
+
+## Style and best-practices checking
+
+We use scripts to check for various problems in the formatting and style
+of our source code.  The "check-spaces" test detects a bunch of violations
+of our coding style on the local level.  The "check-best-practices" test
+looks for violations of some of our complexity guidelines.
+
+You can tell the tool about exceptions to the complexity guidelines via its
+exceptions file (scripts/maint/practracker/exceptions.txt).  But before you
+do this, consider whether you shouldn't fix the underlying problem.  Maybe
+that file really _is_ too big.  Maybe that function really _is_ doing too
+much.  (On the other hand, for stable release series, it is sometimes better
+to leave things unrefactored.)
